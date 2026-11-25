@@ -1,0 +1,12 @@
+node_modules/
+.output/
+.wxt/
+playwright-report/
+test-results/
+.DS_Store
+*.zip
+
+# Local-only project context (not published)
+.cortex/
+.design/
+.development_document/
