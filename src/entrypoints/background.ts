@@ -16,7 +16,10 @@ import {
   restoreJob,
 } from '@/core/executor';
 import { runBatchLinkCheck } from '@/core/link-checker';
-import { generateDeadLinkCleanupPlan } from '@/core/planner';
+import {
+  generateDeadLinkCleanupPlan,
+  generateDuplicateCleanupPlan,
+} from '@/core/planner';
 import {
   isTrustedExtensionSender,
   summarizeSnapshot,
@@ -507,6 +510,38 @@ async function handleStudioMessage(
         includeUnreachable,
       });
 
+      await defaultStore.savePlan(plan);
+      const settings = await defaultStore.getSettings(profileKey);
+      await defaultStore.pruneSnapshots(profileKey, settings.backupRetentionCount);
+      return { ok: true, data: plan };
+    }
+
+    case 'CREATE_DUPLICATE_PLAN': {
+      const { scope } = message.payload;
+      const { flattened } = await refreshProjections();
+      const allMeta = await defaultStore.getAllMetadata(profileKey);
+      const metaMap = new Map<string, BookmarkMetadata>(
+        allMeta.map((m) => [m.nodeId, m]),
+      );
+      const snapshot: Snapshot = {
+        snapshotId: makeSnapshotId(),
+        schemaVersion: 1,
+        profileKey,
+        createdAt: Date.now(),
+        reason: 'delete',
+        label: '重複書籤清理前快照',
+        scope,
+        nodes: extractFullSnapshotNodes(flattened),
+        metadata: allMeta,
+      };
+      await defaultStore.saveSnapshot(snapshot);
+      const plan = generateDuplicateCleanupPlan({
+        flattened,
+        scope,
+        metadataByNodeId: metaMap,
+        profileKey,
+        snapshotId: snapshot.snapshotId,
+      });
       await defaultStore.savePlan(plan);
       const settings = await defaultStore.getSettings(profileKey);
       await defaultStore.pruneSnapshots(profileKey, settings.backupRetentionCount);

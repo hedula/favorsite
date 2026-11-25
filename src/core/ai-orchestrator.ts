@@ -9,7 +9,9 @@ import {
 import { collectAllowedDestinationIds } from './planner';
 import {
   createPlanFromValidatedDraft,
+  generateDuplicateCleanupPlan,
   generateRuleBasedPlan,
+  isDuplicateCleanupInstruction,
   type DraftOperationInput,
 } from './planner';
 import {
@@ -67,6 +69,19 @@ export async function orchestrateOrganizePlan(
     precomputedChromeAiError,
     lmGlobal,
   } = params;
+
+  // "Remove duplicates" needs removals, which model output may never contain:
+  // answer it with the deterministic duplicate planner regardless of the engine.
+  if (isDuplicateCleanupInstruction(instruction)) {
+    return generateDuplicateCleanupPlan({
+      flattened,
+      scope,
+      metadataByNodeId,
+      profileKey,
+      snapshotId,
+      instruction,
+    });
+  }
 
   // Direct rule mode — never touches any model
   if (preferredProvider === 'rule') {

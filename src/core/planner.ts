@@ -4,6 +4,7 @@ import {
   wouldCreateCycle,
   type FlattenedTree,
 } from './bookmark-engine';
+import { findDuplicateGroups } from './duplicates';
 import { isDeadLinkCandidate, isLinkCheckCurrent } from './link-checker';
 import type {
   AddTagOperation,
@@ -1078,6 +1079,7 @@ export function generateDeadLinkCleanupPlan(params: {
         path: b.path,
         linkStatus: check?.status,
         httpStatus: check?.httpStatus,
+        removalKind: 'dead_link',
       };
       operations.push(removeOp);
     }
@@ -1102,6 +1104,203 @@ export function generateDeadLinkCleanupPlan(params: {
       action === 'quarantine'
         ? `失效連結整理：移至「${quarantineFolderName}」`
         : '失效連結整理：人工確認後移除失效書籤',
+    source: 'rule',
+    operations,
+    status: 'draft',
+    warnings,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
+ * True when an organize instruction asks to remove / clean up duplicate bookmarks.
+ * Such requests are answered by the deterministic duplicate planner, never by the model
+ * (model output is not allowed to remove bookmarks).
+ */
+export function isDuplicateCleanupInstruction(instruction: string): boolean {
+  const text = instruction.trim();
+  if (!text) return false;
+  if (/去重|dedup|de-dup|(remove|delete|clean\s*up|merge)\s+(the\s+)?duplicates?/i.test(text)) {
+    return true;
+  }
+  return (
+    /重複/.test(text) &&
+    /移除|刪除|刪掉|清理|清除|只留|只保留|保留一|合併|整理/.test(text)
+  );
+}
+
+/**
+ * Builds a previewable cleanup plan for duplicate bookmarks:
+ * - exact duplicates (identical URL): keep the earliest-added copy, propose removing the
+ *   other copies (pre-ticked) and merge their tags into the kept copy;
+ * - suspected duplicates (tracking params / same title): proposed but never pre-ticked.
+ * Only copies inside `scope` are removed; the kept copy may live anywhere, so at least one
+ * copy of every URL always survives. Removals are snapshotted and reversible.
+ */
+export function generateDuplicateCleanupPlan(params: {
+  flattened: FlattenedTree;
+  scope: PlanScope;
+  metadataByNodeId: Map<string, BookmarkMetadata>;
+  profileKey: string;
+  snapshotId: string;
+  instruction?: string;
+}): OrganizePlan {
+  const { flattened, scope, metadataByNodeId, profileKey, snapshotId } = params;
+  const { inScopeBookmarks } = collectScopeNodes(flattened, scope);
+  const inScopeIds = new Set(inScopeBookmarks.map((b) => b.nodeId));
+
+  const effectiveDate = (b: BookmarkProjection) =>
+    metadataByNodeId.get(b.nodeId)?.originalDateAdded ??
+    b.dateAdded ??
+    Number.MAX_SAFE_INTEGER;
+  const pickKeeper = (members: BookmarkProjection[]) =>
+    [...members].sort(
+      (a, b) =>
+        effectiveDate(a) - effectiveDate(b) ||
+        Number(a.nodeId) - Number(b.nodeId) ||
+        a.nodeId.localeCompare(b.nodeId),
+    )[0];
+
+  const groups = findDuplicateGroups(flattened.projections);
+  const operations: PlanOperation[] = [];
+  const removedIds = new Set<string>();
+  const keptIds = new Set<string>();
+  const mergedTagsByKeeper = new Map<string, Set<string>>();
+  let opSeq = 1;
+  let exactGroups = 0;
+  let suspectedGroups = 0;
+
+  const proposeRemoval = (
+    victim: BookmarkProjection,
+    keeper: BookmarkProjection,
+    kind: 'duplicate_exact' | 'duplicate_suspected',
+    groupReason: string,
+  ) => {
+    const keeperPath = flattened.byId.get(keeper.parentId)?.path ?? '';
+    operations.push({
+      opId: `op_dup_${opSeq++}`,
+      type: 'removeBookmark',
+      enabled: kind === 'duplicate_exact',
+      requiresReview: kind === 'duplicate_suspected',
+      reviewReason:
+        kind === 'duplicate_suspected' ? `疑似重複：${groupReason}` : undefined,
+      reason:
+        kind === 'duplicate_exact'
+          ? `與「${keeper.title || keeper.url}」網址完全相同，保留最早加入的一筆`
+          : `${groupReason}；建議保留「${keeper.title || keeper.url}」`,
+      nodeId: victim.nodeId,
+      bookmarkTitle: victim.title,
+      bookmarkUrl: victim.url,
+      parentId: victim.parentId,
+      index: victim.index,
+      // Folder path, matching how the kept copy's location is shown
+      path: flattened.byId.get(victim.parentId)?.path ?? victim.path,
+      removalKind: kind,
+      keepNodeId: keeper.nodeId,
+      keepTitle: keeper.title,
+      keepPath: keeperPath,
+    });
+    removedIds.add(victim.nodeId);
+  };
+
+  // Exact duplicates first: they are unambiguous.
+  for (const group of groups.filter((g) => g.kind === 'exact')) {
+    const members = group.nodeIds
+      .map((id) => flattened.byId.get(id))
+      .filter((m): m is BookmarkProjection => Boolean(m));
+    if (members.length < 2) continue;
+    const keeper = pickKeeper(members);
+    let proposed = 0;
+    for (const m of members) {
+      if (m.nodeId === keeper.nodeId || !m.writable || !inScopeIds.has(m.nodeId)) continue;
+      proposeRemoval(m, keeper, 'duplicate_exact', group.reason);
+      proposed++;
+      const tags = metadataByNodeId.get(m.nodeId)?.tags ?? [];
+      if (tags.length > 0) {
+        const merged = mergedTagsByKeeper.get(keeper.nodeId) ?? new Set<string>();
+        tags.forEach((t) => merged.add(t));
+        mergedTagsByKeeper.set(keeper.nodeId, merged);
+      }
+    }
+    if (proposed > 0) {
+      exactGroups++;
+      keptIds.add(keeper.nodeId);
+    }
+  }
+
+  // Suspected duplicates: consider only copies that survive the exact pass.
+  for (const group of groups.filter((g) => g.kind === 'suspected')) {
+    const members = group.nodeIds
+      .map((id) => flattened.byId.get(id))
+      .filter((m): m is BookmarkProjection => Boolean(m) && !removedIds.has(m!.nodeId));
+    if (members.length < 2) continue;
+    const keeper = pickKeeper(members);
+    let proposed = 0;
+    for (const m of members) {
+      if (
+        m.nodeId === keeper.nodeId ||
+        keptIds.has(m.nodeId) ||
+        !m.writable ||
+        !inScopeIds.has(m.nodeId) ||
+        removedIds.has(m.nodeId)
+      ) {
+        continue;
+      }
+      proposeRemoval(m, keeper, 'duplicate_suspected', group.reason);
+      proposed++;
+    }
+    if (proposed > 0) suspectedGroups++;
+  }
+
+  // Keep the tags of removed exact copies on the surviving bookmark.
+  for (const [keeperId, tagSet] of mergedTagsByKeeper) {
+    const keeper = flattened.byId.get(keeperId);
+    if (!keeper) continue;
+    const existingTags = metadataByNodeId.get(keeperId)?.tags ?? [];
+    const toAdd = [...tagSet].filter((t) => !existingTags.includes(t));
+    if (toAdd.length === 0) continue;
+    operations.push({
+      opId: `op_dup_${opSeq++}`,
+      type: 'addTag',
+      enabled: true,
+      reason: '合併被移除之重複書籤的標籤',
+      nodeId: keeperId,
+      bookmarkTitle: keeper.title,
+      tagsToAdd: toAdd,
+      existingTags,
+    });
+  }
+
+  const exactRemovals = operations.filter(
+    (o) => o.type === 'removeBookmark' && o.removalKind === 'duplicate_exact',
+  ).length;
+  const suspectedRemovals = operations.filter(
+    (o) => o.type === 'removeBookmark' && o.removalKind === 'duplicate_suspected',
+  ).length;
+
+  const warnings: string[] = [];
+  if (exactRemovals + suspectedRemovals === 0) {
+    warnings.push('所選範圍內沒有可清理的重複書籤。');
+  } else {
+    warnings.push(
+      `精確重複 ${exactGroups} 組：每組保留最早加入的一筆，其餘 ${exactRemovals} 筆已預設勾選移除。` +
+        (suspectedRemovals > 0
+          ? ` 疑似重複 ${suspectedGroups} 組（${suspectedRemovals} 筆）未預設勾選，請逐筆確認。`
+          : '') +
+        ' 移除前會保存快照，可於歷程頁復原。',
+    );
+  }
+
+  const now = Date.now();
+  return {
+    planId: makeId('plan'),
+    profileKey,
+    revision: 1,
+    snapshotId,
+    scope,
+    scopeFingerprint: computeScopeFingerprint(flattened, scope),
+    instruction: params.instruction?.trim() || '重複書籤清理：每組保留最早加入的一筆',
     source: 'rule',
     operations,
     status: 'draft',

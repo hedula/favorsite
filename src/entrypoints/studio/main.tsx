@@ -8,7 +8,10 @@ import {
   type FlattenedTree,
 } from '@/core/bookmark-engine';
 import { findDuplicateGroups } from '@/core/duplicates';
-import { collectAllowedDestinationIds } from '@/core/planner';
+import {
+  collectAllowedDestinationIds,
+  isDuplicateCleanupInstruction,
+} from '@/core/planner';
 import {
   collectCheckableOrigins,
   isDeadLinkCandidate,
@@ -898,6 +901,25 @@ function StudioApp() {
                   handleCheckLinks(targets);
                 }}
                 onBatchMove={(destId) => void handleBatchMovePreview(destId)}
+                onGenerateDuplicatePlan={() => {
+                  void (async () => {
+                    const plan = await runAction(
+                      () =>
+                        sendStudioMessage({
+                          type: 'CREATE_DUPLICATE_PLAN',
+                          payload: { scope: { type: 'all', targetFolderIds: [] } },
+                        }),
+                      '已產生重複書籤清理預覽（尚未修改 Chrome 書籤）。',
+                    );
+                    if (plan) {
+                      setActivePlan(plan);
+                      setLastAppliedJob(null);
+                      setRightMode('organize');
+                      setTabletRightOpen(true);
+                      setMobilePane('inspector');
+                    }
+                  })();
+                }}
               />
             </main>
 
@@ -981,10 +1003,13 @@ function StudioApp() {
                   // When Chrome Prompt API is selected or prioritized ('auto'),
                   // invoke LanguageModel inside the foreground click gesture so Chrome allows
                   // on-device Gemini Nano download if availability === 'downloadable'.
+                  // Duplicate cleanup is answered by the deterministic planner in the
+                  // worker; calling the model first would only waste time.
                   if (
                     (params.mode === 'auto' ||
                       params.mode === 'chrome-prompt-api') &&
-                    promptApiStatus?.supported
+                    promptApiStatus?.supported &&
+                    !isDuplicateCleanupInstruction(params.instruction)
                   ) {
                     const { inScopeBookmarks } = collectScopeNodes(
                       flattened,

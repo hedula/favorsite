@@ -568,6 +568,13 @@ export function InspectorPanel({
               >
                 自動補上主題標籤
               </button>
+              <button
+                type="button"
+                className="prompt-chip"
+                onClick={() => setInstruction('移除重複書籤，每組只保留一筆')}
+              >
+                移除重複書籤
+              </button>
             </div>
           </div>
 
@@ -938,7 +945,8 @@ export function InspectorPanel({
                       }}
                     >
                       <div className="tree-section-title">
-                        移除失效書籤（需人工勾選 · {removeOps.length}）
+                        移除書籤（已勾選{' '}
+                        {removeOps.filter((o) => o.enabled).length}/{removeOps.length}）
                       </div>
                       {removeOps.some(
                         (o) =>
@@ -993,19 +1001,30 @@ export function InspectorPanel({
                                 <strong>{op.bookmarkTitle}</strong>
                                 <span
                                   className={`wf-badge ${
+                                    op.removalKind === 'duplicate_exact' ||
                                     op.linkStatus === 'dead_404_410'
                                       ? 'danger'
                                       : 'warn'
                                   }`}
                                 >
-                                  {op.linkStatus === 'dead_404_410'
-                                    ? `HTTP ${op.httpStatus ?? 404}`
-                                    : '無法連線'}
+                                  {op.removalKind === 'duplicate_exact'
+                                    ? '完全重複'
+                                    : op.removalKind === 'duplicate_suspected'
+                                      ? '疑似重複'
+                                      : op.linkStatus === 'dead_404_410'
+                                        ? `HTTP ${op.httpStatus ?? 404}`
+                                        : '無法連線'}
                                 </span>
                               </div>
                               <div className="op-path">
                                 位置：{op.path}
                               </div>
+                              {op.keepNodeId && (
+                                <div className="op-path">
+                                  保留：{op.keepTitle || '(無標題)'}
+                                  {op.keepPath ? `（${op.keepPath}）` : ''}
+                                </div>
+                              )}
                               {op.bookmarkUrl && (
                                 <div
                                   className="wf-mono wf-muted"

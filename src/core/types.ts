@@ -184,6 +184,12 @@ export interface RemoveBookmarkOperation extends BasePlanOperation {
   path: string;
   linkStatus?: LinkCheckStatus;
   httpStatus?: number;
+  /** Why this removal was proposed; drives the preview label. */
+  removalKind?: 'dead_link' | 'duplicate_exact' | 'duplicate_suspected';
+  /** For duplicates: the copy that is kept. */
+  keepNodeId?: string;
+  keepTitle?: string;
+  keepPath?: string;
 }
 
 export type PlanOperation =

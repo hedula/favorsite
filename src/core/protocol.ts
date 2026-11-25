@@ -107,6 +107,10 @@ export type StudioMessage =
       };
     }
   | {
+      type: 'CREATE_DUPLICATE_PLAN';
+      payload: { scope: PlanScope };
+    }
+  | {
       type: 'OPEN_STUDIO';
       payload?: { tab?: 'workspace' | 'organize' | 'history' | 'settings' };
     };
@@ -250,6 +254,8 @@ export function validateStudioMessage(message: unknown): string | null {
         (p.includeUnreachable === undefined || typeof p.includeUnreachable === 'boolean')
         ? null
         : bad;
+    case 'CREATE_DUPLICATE_PLAN':
+      return isObj(p) && isValidScope(p.scope) ? null : bad;
     default:
       return '未知的訊息類型。';
   }
@@ -278,6 +284,7 @@ export type MessageResponseMap = {
   PRUNE_SNAPSHOTS: { removed: number };
   CHECK_LINKS: BatchLinkCheckResult;
   CREATE_DEAD_LINK_PLAN: OrganizePlan;
+  CREATE_DUPLICATE_PLAN: OrganizePlan;
   OPEN_STUDIO: { opened: boolean };
 };
 

@@ -104,6 +104,7 @@ interface BookmarkListProps {
   onStartOrganize: () => void;
   onCheckLinks: () => void;
   onBatchMove: (targetFolderId: string) => void;
+  onGenerateDuplicatePlan: () => void;
 }
 
 function formatDate(ts?: number): string {
@@ -141,6 +142,7 @@ export function BookmarkList({
   onStartOrganize,
   onCheckLinks,
   onBatchMove,
+  onGenerateDuplicatePlan,
 }: BookmarkListProps) {
   const [dragOverRowId, setDragOverRowId] = useState<string | null>(null);
   const [movePickerNodeId, setMovePickerNodeId] = useState<string | null>(null);
@@ -445,6 +447,22 @@ export function BookmarkList({
             </button>
           </div>
         </div>
+
+        {smartView === 'duplicates' && duplicateGroups.length > 0 && (
+          <div className="list-toolbar-row">
+            <span className="wf-muted">
+              精確重複會保留最早加入的一筆並預設勾選移除；疑似重複只列出，需人工確認。
+            </span>
+            <button
+              type="button"
+              className="sm primary"
+              disabled={busy}
+              onClick={onGenerateDuplicatePlan}
+            >
+              產生重複清理預覽
+            </button>
+          </div>
+        )}
 
         {smartView !== 'duplicates' && (
           <div className="list-toolbar-row">
