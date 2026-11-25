@@ -116,7 +116,7 @@ export async function probePromptApiAvailability(
       supported: false,
       availability: 'unsupported',
       reason:
-        '此 Chrome 版本或環境尚未啟用內建 LanguageModel API（需桌面版 Chrome 148+ 與 Gemini Nano 支援）。',
+        '此 Chrome 版本或環境尚未啟用內建 LanguageModel API（擴充功能需桌面版 Chrome 138 以上，且裝置支援 Gemini Nano）。',
     };
   }
 
