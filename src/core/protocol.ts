@@ -6,6 +6,8 @@ import {
   type DraftOperationInput,
 } from './planner';
 import type { SemanticDraft } from './semantic-classifier';
+import { isKnowledgeMessage, validateKnowledgeMessage, type KnowledgeMessage, type KnowledgeResponseMap } from './knowledge-protocol';
+import type { BuildIdentity } from './runtime-status';
 import type {
   AiProviderPreference,
   AppSettings,
@@ -21,12 +23,18 @@ import type {
 } from './types';
 
 export const UNKNOWN_STUDIO_MESSAGE = '未知的訊息類型。';
-const BACKGROUND_UPDATE_REQUIRED =
-  'Favorsite 的背景程式需要更新。請到 chrome://extensions 重新載入 Favorsite，再重開工作台。';
+export const BACKGROUND_UPDATE_REQUIRED =
+  'Favorsite 的工作台與背景程式版本不同。請到 Chrome 擴充功能管理重新載入 Favorsite，再重開工作台。';
 
-class UnsupportedStudioMessageError extends Error {}
+export class UnsupportedStudioMessageError extends Error {
+  constructor(readonly messageType: StudioMessage['type']) {
+    super(BACKGROUND_UPDATE_REQUIRED);
+    this.name = 'UnsupportedStudioMessageError';
+  }
+}
 
 export type StudioMessage =
+  | KnowledgeMessage
   | { type: 'GET_BOOTSTRAP_STATE' }
   | { type: 'REBUILD_INDEX' }
   | {
@@ -90,6 +98,10 @@ export type StudioMessage =
       type: 'EXPORT_BACKUP';
     }
   | {
+      type: 'EXPORT_SNAPSHOT';
+      payload: { snapshotId: string };
+    }
+  | {
       type: 'RESTORE_BACKUP';
       payload: {
         backup: BackupPayload;
@@ -124,10 +136,11 @@ export type StudioMessage =
     }
   | {
       type: 'OPEN_STUDIO';
-      payload?: { tab?: 'workspace' | 'organize' | 'history' | 'settings' };
+      payload?: { tab?: 'workspace' | 'organize' | 'history' | 'settings' | 'knowledge' };
     };
 
 export interface BootstrapState {
+  runtime?: BuildIdentity;
   profileKey: string;
   projections: BookmarkProjection[];
   metadata: BookmarkMetadata[];
@@ -177,6 +190,7 @@ function isValidScope(v: unknown): boolean {
  */
 export function validateStudioMessage(message: unknown): string | null {
   if (!isObj(message) || !isStr(message.type)) return '訊息格式無效。';
+  if (isKnowledgeMessage(message as { type: string })) return validateKnowledgeMessage(message);
   const p = message.payload;
   const bad = '訊息內容格式無效。';
   switch (message.type) {
@@ -258,6 +272,8 @@ export function validateStudioMessage(message: unknown): string | null {
       return isObj(p) && isObj(p.backup) && isStr(p.targetParentId) && isOptStr(p.branchTitle)
         ? null
         : bad;
+    case 'EXPORT_SNAPSHOT':
+      return isObj(p) && isStr(p.snapshotId) && p.snapshotId.length > 0 ? null : bad;
     case 'SAVE_SETTINGS':
       return isObj(p) && isObj(p.settings) ? null : bad;
     case 'PRUNE_SNAPSHOTS':
@@ -286,7 +302,7 @@ export type StudioResponse<T = unknown> =
   | { ok: true; data: T }
   | { ok: false; error: string };
 
-export type MessageResponseMap = {
+export type MessageResponseMap = KnowledgeResponseMap & {
   GET_BOOTSTRAP_STATE: BootstrapState;
   REBUILD_INDEX: { count: number };
   CREATE_BOOKMARK: { nodeId: string };
@@ -300,6 +316,7 @@ export type MessageResponseMap = {
   RESTORE_JOB: ExecutionJob;
   RESOLVE_JOB_STEP: ExecutionJob;
   EXPORT_BACKUP: BackupPayload;
+  EXPORT_SNAPSHOT: BackupPayload;
   RESTORE_BACKUP: RestoreBackupResult;
   SAVE_SETTINGS: AppSettings;
   PRUNE_SNAPSHOTS: { removed: number };
@@ -332,8 +349,8 @@ export async function sendStudioMessage<M extends StudioMessage>(
     throw new Error('擴充功能背景服務無回應，請重新整理頁面。');
   }
   if (!res.ok) {
-    if (res.error === UNKNOWN_STUDIO_MESSAGE) {
-      throw new UnsupportedStudioMessageError(res.error);
+    if (res.error?.trim() === UNKNOWN_STUDIO_MESSAGE) {
+      throw new UnsupportedStudioMessageError(message.type);
     }
     throw new Error(res.error || '操作失敗');
   }

@@ -1,5 +1,5 @@
 import { orchestrateOrganizePlan } from '@/core/ai-orchestrator';
-import { exportBackupPayload, restoreBackupToFolder } from '@/core/backup';
+import { exportBackupPayload, exportSnapshotBackupPayload, restoreBackupToFolder } from '@/core/backup';
 import {
   buildProjections,
   computeScopeFingerprint,
@@ -17,6 +17,10 @@ import {
   restoreJob,
 } from '@/core/executor';
 import { runBatchLinkCheck } from '@/core/link-checker';
+import { isKnowledgeMessage } from '@/core/knowledge-protocol';
+import { executeMcpKnowledgeTool, handleKnowledgeMessage } from '@/core/knowledge-service';
+import { ensureNativeBridge, setNativeToolHandler } from '@/core/native-bridge';
+import { getBuildIdentity } from '@/core/runtime-status';
 import {
   generateDeadLinkCleanupPlan,
   generateDuplicateCleanupPlan,
@@ -104,6 +108,9 @@ async function openStudioTab(tab?: string): Promise<void> {
 async function handleStudioMessage(
   message: StudioMessage,
 ): Promise<StudioResponse> {
+  if (isKnowledgeMessage(message)) {
+    return { ok: true, data: await handleKnowledgeMessage(message) };
+  }
   const adapter = createChromeBookmarkAdapter();
   const profileKey = await defaultStore.getOrCreateProfileKey();
 
@@ -127,6 +134,7 @@ async function handleStudioMessage(
         ]);
 
       const state: BootstrapState = {
+        runtime: getBuildIdentity(),
         profileKey,
         projections: flattened.projections,
         metadata,
@@ -478,6 +486,12 @@ async function handleStudioMessage(
       return { ok: true, data: payload };
     }
 
+    case 'EXPORT_SNAPSHOT': {
+      const snapshot = await defaultStore.getSnapshot(message.payload.snapshotId);
+      const payload = exportSnapshotBackupPayload(snapshot, profileKey);
+      return { ok: true, data: payload };
+    }
+
     case 'RESTORE_BACKUP': {
       const { backup, targetParentId, branchTitle } = message.payload;
       const result = await restoreBackupToFolder({
@@ -633,6 +647,7 @@ async function handleStudioMessage(
 }
 
 export default defineBackground(() => {
+  setNativeToolHandler(executeMcpKnowledgeTool);
   // Synchronous top-level event listener registration (MV3 Service Worker lifecycle rule)
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
@@ -643,6 +658,7 @@ export default defineBackground(() => {
         store: defaultStore,
         profileKey,
       });
+      await ensureNativeBridge();
     })();
   });
 
@@ -655,6 +671,7 @@ export default defineBackground(() => {
         store: defaultStore,
         profileKey,
       });
+      await ensureNativeBridge();
     })();
   });
 
@@ -688,7 +705,9 @@ export default defineBackground(() => {
     }
 
     // Ignore internal broadcast notifications
-    if (message.type === 'BOOKMARKS_CHANGED') {
+    if (message.type === 'BOOKMARKS_CHANGED' || message.type === 'KNOWLEDGE_CHANGED' ||
+      message.type === 'KNOWLEDGE_PROGRESS' ||
+      message.type === 'FAVORSITE_OFFSCREEN') {
       return false;
     }
 
@@ -710,4 +729,5 @@ export default defineBackground(() => {
 
     return true;
   });
+  void ensureNativeBridge().catch(() => {});
 });

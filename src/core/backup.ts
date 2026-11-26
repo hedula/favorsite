@@ -11,6 +11,8 @@ import type {
   BookmarkApiAdapter,
   BookmarkMetadata,
   ChromeBookmarkNode,
+  Snapshot,
+  SnapshotNode,
 } from './types';
 
 const MAX_BACKUP_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -158,6 +160,102 @@ export function exportBackupPayload(params: {
       ...m,
       tags: [...m.tags],
     })),
+  };
+}
+
+/** Rebuilds the captured scope without including unrelated branches from a full snapshot. */
+export function exportSnapshotBackupPayload(
+  snapshot: Snapshot | undefined,
+  profileKey: string,
+): BackupPayload {
+  if (!snapshot || snapshot.profileKey !== profileKey) {
+    throw new Error('找不到目前設定檔的快照，可能已清理。');
+  }
+  if (snapshot.schemaVersion !== 1 || !Array.isArray(snapshot.nodes) ||
+    !Array.isArray(snapshot.metadata) || !snapshot.scope) {
+    throw new Error('快照內容格式無效，無法匯出。');
+  }
+
+  const byId = new Map<string, SnapshotNode>();
+  const children = new Map<string, SnapshotNode[]>();
+  for (const node of snapshot.nodes) {
+    if (!node || typeof node.id !== 'string' || !node.id || byId.has(node.id) ||
+      typeof node.title !== 'string' || typeof node.isFolder !== 'boolean' ||
+      (node.parentId !== undefined && typeof node.parentId !== 'string') ||
+      (node.index !== undefined && (!Number.isInteger(node.index) || node.index < 0))) {
+      throw new Error('快照節點格式無效或識別值重複，無法匯出。');
+    }
+    byId.set(node.id, node);
+    if (node.parentId) {
+      const siblings = children.get(node.parentId) ?? [];
+      siblings.push(node);
+      children.set(node.parentId, siblings);
+    }
+  }
+  for (const siblings of children.values()) {
+    siblings.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  }
+
+  let selectedIds: string[];
+  if (snapshot.scope.type === 'all') {
+    selectedIds = snapshot.nodes.filter((node) => !node.parentId || !byId.has(node.parentId))
+      .map((node) => node.id);
+  } else if (snapshot.scope.type === 'folder' && typeof snapshot.scope.folderId === 'string') {
+    selectedIds = [snapshot.scope.folderId];
+  } else if (snapshot.scope.type === 'selection' && Array.isArray(snapshot.scope.bookmarkIds) &&
+    snapshot.scope.bookmarkIds.every((id) => typeof id === 'string')) {
+    selectedIds = [...new Set(snapshot.scope.bookmarkIds)];
+  } else {
+    throw new Error('快照的整理範圍無效，無法匯出。');
+  }
+  if (!selectedIds.length || selectedIds.some((id) => !byId.has(id))) {
+    throw new Error('快照缺少所選範圍的節點，無法匯出。');
+  }
+
+  const selected = new Set(selectedIds);
+  const roots = selectedIds.filter((id) => {
+    let parentId = byId.get(id)?.parentId;
+    const ancestors = new Set([id]);
+    while (parentId && byId.has(parentId)) {
+      if (ancestors.has(parentId)) throw new Error('快照含有循環資料夾，無法匯出。');
+      if (selected.has(parentId)) return false;
+      ancestors.add(parentId);
+      parentId = byId.get(parentId)?.parentId;
+    }
+    return true;
+  }).map((id) => byId.get(id)!).sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  if (!roots.length) throw new Error('快照含有循環資料夾，無法匯出。');
+
+  const included = new Set<string>();
+  const buildNode = (node: SnapshotNode, depth: number): BackupTreeNode => {
+    if (depth > MAX_TREE_DEPTH || included.has(node.id) ||
+      (node.isFolder && node.url !== undefined) ||
+      (!node.isFolder && (typeof node.url !== 'string' || children.has(node.id)))) {
+      throw new Error('快照子樹結構無效或層級過深，無法匯出。');
+    }
+    included.add(node.id);
+    return {
+      originalId: node.id,
+      title: node.title,
+      url: node.isFolder ? undefined : node.url,
+      dateAdded: node.dateAdded,
+      folderType: node.folderType,
+      syncing: node.syncing,
+      isFolder: node.isFolder,
+      children: node.isFolder ? (children.get(node.id) ?? []).map((child) => buildNode(child, depth + 1)) : undefined,
+    };
+  };
+  const tree = roots.map((node) => buildNode(node, 0));
+  if (snapshot.scope.type === 'all' && included.size !== byId.size) {
+    throw new Error('快照含有無法連接的節點，無法匯出。');
+  }
+  return {
+    schemaVersion: 1,
+    exportedAt: snapshot.createdAt,
+    profileKey,
+    tree,
+    metadata: snapshot.metadata.filter((item) => item && item.profileKey === profileKey && included.has(item.nodeId))
+      .map((item) => ({ ...item, tags: Array.isArray(item.tags) ? [...item.tags] : [] })),
   };
 }
 

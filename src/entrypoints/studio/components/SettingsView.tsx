@@ -1,6 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import type { PromptApiStatus } from '@/core/prompt-api';
-import type { AiProviderPreference, AppSettings } from '@/core/types';
+import { sendStudioMessage } from '@/core/protocol';
+import { getBuildIdentity, type RuntimeStatus } from '@/core/runtime-status';
+import type { AiProviderPreference, AppSettings, BookmarkProjection } from '@/core/types';
+import { McpSettings } from './McpSettings';
 import {
   IconHistory,
   IconShield,
@@ -10,6 +13,7 @@ import {
 
 interface SettingsViewProps {
   settings: AppSettings;
+  folders: BookmarkProjection[];
   promptApiStatus: PromptApiStatus | null;
   busy: boolean;
   onRefreshPromptApiStatus: () => Promise<void>;
@@ -19,6 +23,7 @@ interface SettingsViewProps {
 
 export function SettingsView({
   settings,
+  folders,
   promptApiStatus,
   busy,
   onRefreshPromptApiStatus,
@@ -34,6 +39,17 @@ export function SettingsView({
   const [grantedPublicOrigins, setGrantedPublicOrigins] = useState<string[]>([]);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const studioBuild = getBuildIdentity();
+
+  const refreshRuntimeStatus = async () => {
+    try {
+      const status = await sendStudioMessage({ type: 'GET_RUNTIME_STATUS' });
+      setRuntimeStatus(status);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const refreshPublicOrigins = async () => {
     try {
@@ -46,6 +62,7 @@ export function SettingsView({
 
   useEffect(() => {
     void refreshPublicOrigins();
+    void refreshRuntimeStatus();
   }, []);
 
   return (
@@ -60,6 +77,23 @@ export function SettingsView({
           <span>{errorMsg}</span>
         </div>
       )}
+
+      <section className="section-box" aria-label="版本與本機模型">
+        <div className="section-header">
+          <h2 className="section-title">版本與本機模型</h2>
+          <button type="button" className="sm" onClick={() => void refreshRuntimeStatus()}>檢查版本與模型</button>
+        </div>
+        <div className="knowledge-build-info">
+          <span>工作台版本 {studioBuild.extensionVersion}</span>
+          <code>{studioBuild.buildId}</code>
+        </div>
+        {runtimeStatus && <>
+          <div className="knowledge-build-info"><span>背景服務版本 {runtimeStatus.extensionVersion}</span><code>{runtimeStatus.buildId}</code></div>
+          {runtimeStatus.buildId !== studioBuild.buildId && <div className="wf-banner warn" role="status">工作台與背景服務版本不同，請重新載入 Favorsite 並重開工作台。</div>}
+          <div className={`wf-banner ${runtimeStatus.semanticModel.state === 'ready' ? 'ok' : 'warn'}`} role="status"><span>{runtimeStatus.semanticModel.reason}</span></div>
+          <div className="wf-muted">語意模型 {runtimeStatus.semanticModel.modelId} · 首次查詢時載入</div>
+        </>}
+      </section>
 
       <section className="section-box">
         <div className="section-title-group">
@@ -120,7 +154,7 @@ export function SettingsView({
             <option value="chrome-prompt-api">
               Chrome Prompt API（Gemini Nano · 不支援時降級本機離線規則）
             </option>
-            <option value="transformers-js">本機語意分類（Transformers.js）</option>
+            <option value="transformers-js" disabled={runtimeStatus?.semanticModel.state !== 'ready'}>本機語意分類（Transformers.js）</option>
             <option value="rule">一律使用本機離線規則（不呼叫 AI）</option>
           </select>
         </div>
@@ -134,6 +168,8 @@ export function SettingsView({
           允許本機模型分析裁剪後的 URL 路徑。Query、fragment 與憑證會先排除。
         </label>
       </section>
+
+      <McpSettings folders={folders} />
 
       <section className="section-box">
         <div className="section-title-group">

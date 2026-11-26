@@ -1191,6 +1191,139 @@ code {
 }
 
 
+/* Knowledge and desktop connection views use the approved form and tonal tokens. */
+.knowledge-page {
+  min-width: 0;
+}
+
+.knowledge-form,
+.knowledge-source-list,
+.knowledge-source-row,
+.knowledge-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.knowledge-form p,
+.knowledge-source-row p,
+.knowledge-excerpt {
+  margin: 0;
+}
+
+.knowledge-actions,
+.knowledge-build-info {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.knowledge-source-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.knowledge-source-row {
+  gap: 8px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--md-surface-container);
+}
+
+.knowledge-source-row:last-child {
+  border-bottom: 0;
+}
+
+.knowledge-source-title {
+  font-size: 16px;
+  line-height: 22px;
+  font-weight: 600;
+}
+
+.knowledge-source-row a,
+.knowledge-source-url {
+  color: var(--md-primary);
+  overflow-wrap: anywhere;
+}
+
+.knowledge-excerpt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 400px;
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-radius-sm);
+  padding: 12px;
+}
+
+.knowledge-scope legend {
+  padding: 0 4px;
+  font-size: 13px;
+}
+
+.knowledge-connection {
+  border-radius: var(--md-radius-sm);
+  background: var(--md-surface-low);
+  padding: 12px;
+  min-width: 0;
+}
+
+.knowledge-connection summary,
+.knowledge-source-row summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-connection > .knowledge-form {
+  margin-top: 12px;
+}
+
+.knowledge-command {
+  padding: 12px;
+  border-radius: var(--md-radius-sm);
+  background: var(--md-surface-lowest);
+  font-family: var(--md-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.knowledge-chunk h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  line-height: 22px;
+  font-weight: 600;
+}
+
+.knowledge-build-info code {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+@media (max-width: 639px) {
+  .knowledge-actions button {
+    flex-grow: 1;
+  }
+}
+
 /* Respect the OS "reduce motion" setting: no transitions or animations */
 @media (prefers-reduced-motion: reduce) {
   *,

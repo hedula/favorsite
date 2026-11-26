@@ -26,7 +26,14 @@ import {
   requestChromePromptApiPlan,
   type PromptApiStatus,
 } from '@/core/prompt-api';
-import { requestDuplicateDeletion, sendStudioMessage, type BootstrapState } from '@/core/protocol';
+import {
+  BACKGROUND_UPDATE_REQUIRED,
+  UnsupportedStudioMessageError,
+  requestDuplicateDeletion,
+  sendStudioMessage,
+  type BootstrapState,
+} from '@/core/protocol';
+import { backgroundMatchesStudio } from '@/core/runtime-status';
 import { BookmarkSearchIndex } from '@/core/search';
 import { buildSemanticDraft, type SemanticDraft } from '@/core/semantic-classifier';
 import { embedWithTransformers } from '@/core/semantic-client';
@@ -45,13 +52,26 @@ import { FolderTree, type SmartViewType } from './components/FolderTree';
 import { HistoryBackupView } from './components/HistoryBackupView';
 import { IconSearch, IconShield } from './components/Icons';
 import { InspectorPanel, type RightPaneMode } from './components/InspectorPanel';
+import { KnowledgeView } from './components/KnowledgeView';
 import { SettingsView } from './components/SettingsView';
 import '@/styles/theme.css';
 
-type StudioTab = 'workspace' | 'history' | 'settings';
+type StudioTab = 'workspace' | 'knowledge' | 'history' | 'settings';
 type MobilePane = 'folders' | 'list' | 'inspector';
 
 const EXPANDED_STORAGE_KEY = 'favorsite_expanded_folders_v1';
+
+function downloadBackup(payload: BackupPayload, kind: 'backup' | 'snapshot') {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `favorsite-${kind}-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
 
 function loadExpandedIds(): Set<string> {
   try {
@@ -67,6 +87,7 @@ function loadExpandedIds(): Set<string> {
 
 function StudioApp() {
   const [state, setState] = useState<BootstrapState | null>(null);
+  const [backgroundUpdateRequired, setBackgroundUpdateRequired] = useState(false);
   const [activeTab, setActiveTab] = useState<StudioTab>('workspace');
   const [smartView, setSmartView] = useState<SmartViewType>('all');
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
@@ -144,7 +165,9 @@ function StudioApp() {
       const data = await sendStudioMessage({ type: 'GET_BOOTSTRAP_STATE' });
       setState(data);
       searchIndexRef.current.rebuild(data.projections, data.metadata);
+      setBackgroundUpdateRequired(!backgroundMatchesStudio(data.runtime));
     } catch (err) {
+      if (err instanceof UnsupportedStudioMessageError) setBackgroundUpdateRequired(true);
       setBanner({
         kind: 'danger',
         text: err instanceof Error ? err.message : String(err),
@@ -155,7 +178,9 @@ function StudioApp() {
   // Parse hash navigation from Popup (#workspace, #organize, #history, #settings)
   useEffect(() => {
     const hash = window.location.hash.replace(/^#/, '');
-    if (hash === 'history') {
+    if (hash === 'knowledge') {
+      setActiveTab('knowledge');
+    } else if (hash === 'history') {
       setActiveTab('history');
     } else if (hash === 'settings') {
       setActiveTab('settings');
@@ -587,16 +612,7 @@ function StudioApp() {
       '已產生 JSON 備份檔並開始下載。',
     );
     if (!payload) return;
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: 'application/json',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `favorsite-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    // Revoking synchronously can cancel the download before it starts
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    downloadBackup(payload, 'backup');
   };
 
   const interruptedJob = state?.jobs.find(
@@ -628,6 +644,13 @@ function StudioApp() {
             </button>
             <button
               type="button"
+              aria-current={activeTab === 'knowledge' ? 'page' : undefined}
+              onClick={() => setActiveTab('knowledge')}
+            >
+              知識庫
+            </button>
+            <button
+              type="button"
               aria-current={activeTab === 'history' ? 'page' : undefined}
               onClick={() => setActiveTab('history')}
             >
@@ -643,7 +666,7 @@ function StudioApp() {
             </button>
           </nav>
 
-          <div className="studio-search-wrap">
+          {activeTab !== 'knowledge' && <div className="studio-search-wrap">
             <IconSearch size={16} />
             <input
               type="search"
@@ -660,11 +683,29 @@ function StudioApp() {
                 清除
               </button>
             )}
-          </div>
+          </div>}
         </div>
       </header>
 
       <div className="studio-content-wrap">
+        {backgroundUpdateRequired && (
+          <div className="wf-banner warn" role="status">
+            <span>{BACKGROUND_UPDATE_REQUIRED}</span>
+            <button
+              type="button"
+              className="surface-btn sm"
+              onClick={() => {
+                void chrome.tabs.create({ url: 'chrome://extensions/?id=' + chrome.runtime.id })
+                  .catch(() => setBanner({
+                    kind: 'warn',
+                    text: '請在 Chrome 網址列開啟 chrome://extensions，重新載入 Favorsite 後再重開工作台。',
+                  }));
+              }}
+            >
+              開啟擴充功能管理
+            </button>
+          </div>
+        )}
         {state && !state.settings.firstRunNoticeDismissed && (
           <div className="wf-banner" role="note">
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
@@ -675,7 +716,7 @@ function StudioApp() {
                 <span style={{ fontWeight: 700, color: 'var(--md-primary)' }}>
                   權限說明：
                 </span>
-                Favorsite 使用 Chrome 原生 <code>bookmarks</code> 權限直接整理目前設定檔的書籤；所有整理、Chrome 內建 AI 推理與快照均在本機完成，僅於您手動執行失效連結檢查時申請對應公開網站的選用權限。
+                Favorsite 使用 Chrome 原生書籤權限整理目前設定檔。正文由您在網頁中主動收錄，本機 AI 負責索引與整理。啟用桌面 MCP 後，指定的 AI 可讀取已授權範圍的來源。
               </div>
             </div>
             <button
@@ -727,6 +768,11 @@ function StudioApp() {
         <div style={{ padding: 24 }} className="wf-muted">
           正在載入 Chrome 原生書籤樹…
         </div>
+      ) : activeTab === 'knowledge' ? (
+        <KnowledgeView
+          folders={flattened.projections.filter((projection) => projection.isFolder)}
+          initialFolderId={selectedFolderId}
+        />
       ) : activeTab === 'history' ? (
         <HistoryBackupView
           jobs={state.jobs}
@@ -753,6 +799,15 @@ function StudioApp() {
             }, '已更新待確認步驟，可繼續剩餘項目。');
           }}
           onExportBackup={handleExportBackup}
+          onLoadSnapshot={async (snapshotId) => runAction(() =>
+            sendStudioMessage({ type: 'EXPORT_SNAPSHOT', payload: { snapshotId } }),
+          )}
+          onExportSnapshot={async (snapshotId) => {
+            const payload = await runAction(() =>
+              sendStudioMessage({ type: 'EXPORT_SNAPSHOT', payload: { snapshotId } }),
+            );
+            if (payload) downloadBackup(payload, 'snapshot');
+          }}
           onRestoreBackup={async (params) => {
             const res = await runAction(
               () => sendStudioMessage({ type: 'RESTORE_BACKUP', payload: params }),
@@ -763,6 +818,7 @@ function StudioApp() {
                 text: `還原完成：建立分支「${res.branchTitle}」（${res.createdFolders} 資料夾、${res.createdBookmarks} 書籤，回連 ${res.relinkedTags} 筆標籤）。`,
               });
             }
+            return Boolean(res);
           }}
           onPruneSnapshots={async (retainCount) => {
             const res = await runAction(() =>
@@ -779,6 +835,7 @@ function StudioApp() {
       ) : activeTab === 'settings' ? (
         <SettingsView
           settings={state.settings}
+          folders={flattened.projections.filter((projection) => projection.isFolder)}
           promptApiStatus={promptApiStatus}
           busy={busy}
           onRefreshPromptApiStatus={refreshPromptApiStatus}
@@ -1015,10 +1072,11 @@ function StudioApp() {
                 busy={busy}
                 onSetMode={setRightMode}
                 onCreateNode={async (payload) => {
-                  await runAction(
+                  const created = await runAction(
                     () => sendStudioMessage({ type: 'CREATE_BOOKMARK', payload }),
                     '已建立並寫回 Chrome 原生書籤。',
                   );
+                  return created !== undefined;
                 }}
                 onSaveNode={async (payload) => {
                   await runAction(async () => {

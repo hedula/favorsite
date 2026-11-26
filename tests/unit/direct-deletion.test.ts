@@ -70,6 +70,27 @@ describe('direct deletion through the extension background', () => {
     vi.unstubAllGlobals();
   });
 
+  it('exports a deleted folder snapshot through the UI protocol and restores its subtree', async () => {
+    const { bookmarks, defaultStore, profileKey } = await setupWorker();
+    const folder = await bookmarks.create({ parentId: '1', title: 'Deleted folder' });
+    await bookmarks.create({ parentId: folder.id, title: 'Empty folder' });
+    const article = await bookmarks.create({ parentId: folder.id, title: 'Article', url: 'https://article.example/' });
+    await bookmarks.create({ parentId: '1', title: 'Unrelated', url: 'https://unrelated.example/' });
+    await defaultStore.upsertMetadata({ profileKey, nodeId: article.id, tags: ['saved'], updatedAt: Date.now() });
+    const deleted = await sendStudioMessage({ type: 'REMOVE_BOOKMARK', payload: { nodeId: folder.id, recursive: true } });
+    const backup = await sendStudioMessage({ type: 'EXPORT_SNAPSHOT', payload: { snapshotId: deleted.snapshotId } });
+    expect(backup.tree.map((node) => node.title)).toEqual(['Deleted folder']);
+    expect(backup.metadata.map((item) => item.tags)).toEqual([['saved']]);
+    const result = await sendStudioMessage({ type: 'RESTORE_BACKUP', payload: { backup, targetParentId: '2', branchTitle: 'Recovered folder' } });
+    const [restored] = await bookmarks.getSubTree(result.branchFolderId);
+    expect(restored.children![0].children?.map((child) => child.title)).toEqual(['Empty folder', 'Article']);
+    expect(result).toMatchObject({ createdFolders: 2, createdBookmarks: 1, relinkedTags: 1 });
+    await expect(sendStudioMessage({ type: 'EXPORT_SNAPSHOT', payload: { snapshotId: 'missing' } })).rejects.toThrow('找不到');
+    const snapshot = await defaultStore.getSnapshot(deleted.snapshotId);
+    await defaultStore.saveSnapshot({ ...snapshot!, snapshotId: 'foreign-snapshot', profileKey: 'other-profile' });
+    await expect(sendStudioMessage({ type: 'EXPORT_SNAPSHOT', payload: { snapshotId: 'foreign-snapshot' } })).rejects.toThrow('找不到');
+  });
+
   it.each([
     { legacy: false, messages: ['DELETE_DUPLICATES'] },
     { legacy: true, messages: ['DELETE_DUPLICATES', 'CREATE_DUPLICATE_PLAN', 'SAVE_PLAN', 'APPLY_PLAN'] },

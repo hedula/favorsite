@@ -20,7 +20,7 @@ class FakeWorker extends EventTarget implements EmbeddingWorker {
   }
 }
 
-function setup(idleMs = 1_000) {
+function setup(idleMs = 1_000, timeoutMs = 120_000) {
   const workers: FakeWorker[] = [];
   const client = createEmbeddingClient({
     createWorker: () => {
@@ -30,6 +30,7 @@ function setup(idleMs = 1_000) {
     },
     getAssetBase: () => 'chrome-extension://test/',
     idleMs,
+    timeoutMs,
   });
   return { client, workers };
 }
@@ -113,5 +114,64 @@ describe('semantic embedding client', () => {
     await tick();
     expect(workers[1].terminated).toBe(false);
     client.dispose();
+  });
+
+  it('does not reject a second caller when the first caller cancels', async () => {
+    const { client, workers } = setup();
+    const firstAbort = new AbortController();
+    const first = client.embed(['first query'], firstAbort.signal);
+    const second = client.embed(['second query'], new AbortController().signal)
+      .then((batch) => ({ batch }), (error: unknown) => ({ error }));
+    const rejection = expect(first).rejects.toThrow('cancel first');
+    firstAbort.abort(new Error('cancel first'));
+    await rejection;
+    expect(workers[0].terminated).toBe(false);
+    workers[0].reply(1);
+    await expect(second).resolves.toMatchObject({ batch: { vectors: [[12]] } });
+    client.dispose();
+  });
+
+  it('cleans up synchronous worker creation and postMessage failures', async () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const createWorker = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('constructor failed'); })
+      .mockReturnValue(worker);
+    const client = createEmbeddingClient({
+      createWorker,
+      getAssetBase: () => 'chrome-extension://test/',
+      idleMs: 1_000,
+    });
+    await expect(client.embed(['first'], new AbortController().signal)).rejects.toThrow('constructor failed');
+    vi.spyOn(worker, 'postMessage').mockImplementationOnce(() => { throw new Error('post failed'); });
+    await expect(client.embed(['second'], new AbortController().signal)).rejects.toThrow('post failed');
+    const nextWorker = new FakeWorker();
+    createWorker.mockReturnValue(nextWorker);
+    const next = client.embed(['third'], new AbortController().signal);
+    nextWorker.reply();
+    await next;
+    vi.advanceTimersByTime(1_000);
+    expect(nextWorker.terminated).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    client.dispose();
+  });
+
+  it('times out a stalled caller and replays another pending request on a new worker', async () => {
+    vi.useFakeTimers();
+    const { client, workers } = setup(1_000, 5_000);
+    const first = client.embed(['stalled'], new AbortController().signal);
+    const firstRejected = expect(first).rejects.toThrow('逾時');
+    vi.advanceTimersByTime(1_000);
+    const second = client.embed(['second'], new AbortController().signal);
+    vi.advanceTimersByTime(4_000);
+    await firstRejected;
+    expect(workers[0].terminated).toBe(true);
+    expect(workers).toHaveLength(2);
+    expect(workers[1].requests.map((request) => request.texts)).toEqual([['second']]);
+    workers[0].reply(0);
+    workers[1].reply();
+    await expect(second).resolves.toMatchObject({ vectors: [[6]] });
+    client.dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

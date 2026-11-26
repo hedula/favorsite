@@ -1163,7 +1163,9 @@ export function getDuplicateInstructionIntent(instruction: string): 'cleanup' | 
   const onlyInspection =
     /(?:只|僅)(?:要|想)?\s*(?:先\s*)?(?:找出|查找|列出|顯示|檢查|標記|查看|預覽)/.test(text) ||
     /\b(?:only|just)\s+(?:find|list|show|inspect|mark|preview)\b/i.test(text);
-  if (forbidsMutation || onlyInspection) return 'inspect';
+  const requestsPreview = /預覽|\bpreview\b/i.test(text);
+  const conditionalCleanup = /(?:如果|若|待|等)(?:確認|我確認|審閱|看過)|(?:確認|審閱)(?:後|再)|\b(?:if|after|once)\s+(?:I\s+)?(?:confirm|review|approve)/i.test(text);
+  if (forbidsMutation || onlyInspection || requestsPreview || conditionalCleanup) return 'inspect';
 
   const requestsCleanup =
     /刪|移除|清[理除掉]|合併|只(?:保)?留|保留[一1]|\b(?:remove|delete|clean\s*up|merge)\b/i.test(text);

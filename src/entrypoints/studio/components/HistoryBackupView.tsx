@@ -24,11 +24,13 @@ interface HistoryBackupViewProps {
     resolution: JobStepResolution;
   }) => Promise<void>;
   onExportBackup: () => Promise<void>;
+  onLoadSnapshot: (snapshotId: string) => Promise<BackupPayload | undefined>;
+  onExportSnapshot: (snapshotId: string) => Promise<void>;
   onRestoreBackup: (params: {
     backup: BackupPayload;
     targetParentId: string;
     branchTitle?: string;
-  }) => Promise<void>;
+  }) => Promise<boolean>;
   onPruneSnapshots: (retainCount: number) => Promise<void>;
 }
 
@@ -74,6 +76,8 @@ export function HistoryBackupView({
   onRestoreJob,
   onResolveStep,
   onExportBackup,
+  onLoadSnapshot,
+  onExportSnapshot,
   onRestoreBackup,
   onPruneSnapshots,
 }: HistoryBackupViewProps) {
@@ -85,12 +89,13 @@ export function HistoryBackupView({
     writableFolders[0]?.nodeId ?? '',
   );
   const [branchTitle, setBranchTitle] = useState('');
+  const [previewSource, setPreviewSource] = useState('');
   // Element id to focus once the refreshed job list has rendered and is no longer busy
   const [pendingFocusId, setPendingFocusId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!pendingFocusId || busy) return;
-    const target = document.getElementById(pendingFocusId) as HTMLButtonElement | null;
+    const target = document.getElementById(pendingFocusId) as HTMLButtonElement | HTMLSelectElement | null;
     if (target && !target.disabled) {
       target.focus();
     }
@@ -104,9 +109,24 @@ export function HistoryBackupView({
     const { preview, payload } = validateAndPreviewBackup(text);
     setImportPreview(preview);
     setImportPayload(payload ?? null);
+    setPreviewSource(file.name);
     if (!targetFolderId && writableFolders[0]) {
       setTargetFolderId(writableFolders[0].nodeId);
     }
+  };
+
+  const handleSnapshotPreview = async (snapshot: SnapshotSummary) => {
+    const backup = await onLoadSnapshot(snapshot.snapshotId);
+    if (!backup) return;
+    const { preview, payload } = validateAndPreviewBackup(JSON.stringify(backup));
+    setImportPreview(preview);
+    setImportPayload(payload ?? null);
+    setPreviewSource(snapshot.label);
+    setBranchTitle('');
+    if (!writableFolders.some((folder) => folder.nodeId === targetFolderId)) {
+      setTargetFolderId(writableFolders[0]?.nodeId ?? '');
+    }
+    setPendingFocusId('restore-target-folder');
   };
 
   return (
@@ -365,6 +385,7 @@ export function HistoryBackupView({
                   <div>
                     <strong>備份檔驗證通過 (schema v{importPreview.schemaVersion})</strong>
                   </div>
+                  <div className="wf-muted">還原來源為 {previewSource}</div>
                   <div className="wf-muted">
                     資料夾 {importPreview.totalFolders} 個 · 書籤{' '}
                     {importPreview.totalBookmarks} 筆 · 可重建{' '}
@@ -422,10 +443,12 @@ export function HistoryBackupView({
                           backup: importPayload,
                           targetParentId: targetFolderId,
                           branchTitle: branchTitle.trim() || undefined,
-                        }).then(() => {
+                        }).then((restored) => {
+                          if (!restored) return;
                           setImportPreview(null);
                           setImportPayload(null);
                           setBranchTitle('');
+                          setPreviewSource('');
                         });
                       }}
                     >
@@ -436,6 +459,7 @@ export function HistoryBackupView({
                       onClick={() => {
                         setImportPreview(null);
                         setImportPayload(null);
+                        setPreviewSource('');
                       }}
                     >
                       取消
@@ -479,6 +503,7 @@ export function HistoryBackupView({
                   <th>類型</th>
                   <th>說明</th>
                   <th>節點數</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -490,6 +515,28 @@ export function HistoryBackupView({
                     <td data-label="類型">{s.reason}</td>
                     <td data-label="說明">{s.label}</td>
                     <td data-label="節點數">{s.nodeCount}</td>
+                    <td data-label="操作">
+                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          className="sm"
+                          disabled={busy}
+                          aria-label={`還原快照 ${s.label}`}
+                          onClick={() => void handleSnapshotPreview(s)}
+                        >
+                          還原
+                        </button>
+                        <button
+                          type="button"
+                          className="sm"
+                          disabled={busy}
+                          aria-label={`匯出快照 ${s.label}`}
+                          onClick={() => void onExportSnapshot(s.snapshotId)}
+                        >
+                          匯出 JSON
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>

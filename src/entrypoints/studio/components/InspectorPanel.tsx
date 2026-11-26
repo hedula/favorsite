@@ -52,7 +52,7 @@ interface InspectorPanelProps {
     parentId: string;
     title: string;
     url?: string;
-  }) => Promise<void>;
+  }) => Promise<boolean>;
   onSaveNode: (payload: {
     nodeId: string;
     title: string;
@@ -220,7 +220,8 @@ export function InspectorPanel({
               parentId: newParentId,
               title: newTitle,
               url: createKind === 'bookmark' ? newUrl : undefined,
-            }).then(() => {
+            }).then((created) => {
+              if (!created) return;
               setNewTitle('');
               setNewUrl('');
               onSetMode('organize');

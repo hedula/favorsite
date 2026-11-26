@@ -1,6 +1,6 @@
 {
   "name": "favorsite-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Local-First Chrome extension for organizing native bookmarks with previewable, reversible workflows and optional local AI.",
@@ -12,8 +12,13 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "test:mcp": "node --test tests/mcp/bridge.test.mjs",
     "generate:icons": "node scripts/generate-icons.mjs",
     "prepare:semantic-model": "node scripts/prepare-semantic-model.mjs",
+    "verify:semantic-model": "node scripts/verify-semantic-model.mjs",
+    "mcp:install": "node scripts/install-native-host.mjs",
+    "mcp:package": "node scripts/package-mcp.mjs",
+    "mcp": "node scripts/favorsite-mcp.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

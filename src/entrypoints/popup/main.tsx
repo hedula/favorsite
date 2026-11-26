@@ -7,6 +7,8 @@ import '@/styles/theme.css';
 function PopupApp() {
   const [state, setState] = useState<BootstrapState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [captureMessage, setCaptureMessage] = useState('');
 
   useEffect(() => {
     void (async () => {
@@ -20,7 +22,7 @@ function PopupApp() {
   }, []);
 
   const openStudio = async (
-    tab?: 'workspace' | 'organize' | 'history' | 'settings',
+    tab?: 'workspace' | 'knowledge' | 'organize' | 'history' | 'settings',
   ) => {
     await sendStudioMessage({ type: 'OPEN_STUDIO', payload: { tab } });
     window.close();
@@ -36,6 +38,23 @@ function PopupApp() {
   );
   const latestAppliedJob = state?.jobs.find((j) => j.status === 'completed');
 
+  const capturePage = async () => {
+    setCaptureBusy(true);
+    setError(null);
+    setCaptureMessage('正在收錄目前頁面的正文…');
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id === undefined) throw new Error('請先開啟要收錄的文章。');
+      const result = await sendStudioMessage({ type: 'CAPTURE_CURRENT_PAGE', payload: { tabId: tab.id } });
+      setCaptureMessage(`已${result.created ? '收錄' : '更新'}「${result.source.title}」，共 ${result.source.chunkCount} 段。`);
+    } catch (err) {
+      setCaptureMessage('');
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
+
   return (
     <main className="popup-shell">
       <header className="popup-header">
@@ -48,7 +67,7 @@ function PopupApp() {
             <div className="brand-subtitle">Google Chrome Bookmarks</div>
           </div>
         </div>
-        <span className="wf-badge ok">100% 本機端</span>
+        <span className="wf-badge ok">本機知識庫</span>
       </header>
 
       {error && (
@@ -56,6 +75,7 @@ function PopupApp() {
           <span>{error}</span>
         </div>
       )}
+      {captureMessage && <div className="wf-banner ok" role="status" aria-live="polite">{captureMessage}</div>}
 
       {!state && !error && <p className="wf-muted">正在讀取原生書籤狀態…</p>}
 
@@ -109,6 +129,10 @@ function PopupApp() {
           )}
 
           <div className="popup-actions">
+            <button type="button" className="tonal" disabled={captureBusy} onClick={() => void capturePage()}>
+              {captureBusy ? '正在收錄…' : '收錄本文'}
+            </button>
+            <button type="button" className="surface-btn" onClick={() => void openStudio('knowledge')}>開啟書籤知識庫</button>
             <button
               type="button"
               className="primary"

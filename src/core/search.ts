@@ -8,6 +8,7 @@ interface IndexedBookmarkDoc {
   path: string;
   tags: string;
   url: string;
+  content: string;
 }
 
 const CJK_REGEX = /[\u3400-\u9fff\uf900-\ufaff]/;
@@ -58,20 +59,45 @@ export interface SearchFilter {
   exactDomain?: string;
   tag?: string;
   folderId?: string;
+  includeDescendants?: boolean;
+}
+
+export interface RankedBookmarkMatch {
+  bookmark: BookmarkProjection;
+  score: number;
+  matchedFields: string[];
+}
+
+export function parseBookmarkSearchFilter(filter: SearchFilter): {
+  textQuery: string;
+  exactDomain: string;
+  tagFilter: string;
+} {
+  let exactDomain = filter.exactDomain?.trim().toLowerCase() ?? '';
+  let tagFilter = filter.tag?.trim().toLowerCase() ?? '';
+  const terms: string[] = [];
+  for (const part of (filter.query ?? '').trim().split(/\s+/).filter(Boolean)) {
+    if (part.toLowerCase().startsWith('domain:')) exactDomain = part.slice(7).toLowerCase();
+    else if (part.toLowerCase().startsWith('tag:')) tagFilter = part.slice(4).toLowerCase();
+    else terms.push(part);
+  }
+  return { textQuery: terms.join(' ').trim(), exactDomain, tagFilter };
 }
 
 export class BookmarkSearchIndex {
   private miniSearch: MiniSearch<IndexedBookmarkDoc>;
   private docsById = new Map<string, BookmarkProjection>();
   private tagsById = new Map<string, string[]>();
+  private documentsById = new Map<string, IndexedBookmarkDoc>();
+  private parentsById = new Map<string, string>();
 
   constructor() {
     this.miniSearch = new MiniSearch<IndexedBookmarkDoc>({
-      fields: ['title', 'domain', 'path', 'tags', 'url'],
+      fields: ['title', 'domain', 'path', 'tags', 'url', 'content'],
       storeFields: ['id'],
       tokenize: hybridTokenize,
       searchOptions: {
-        boost: { title: 3, tags: 2.5, domain: 2, path: 1.2, url: 0.8 },
+        boost: { title: 3, tags: 2.5, domain: 2, path: 1.2, url: 0.8, content: 1 },
         prefix: true,
         fuzzy: (term) => (CJK_REGEX.test(term) || term.length <= 3 ? false : 0.2),
       },
@@ -81,72 +107,87 @@ export class BookmarkSearchIndex {
   rebuild(
     projections: BookmarkProjection[],
     metadataList: BookmarkMetadata[],
+    contentByNodeId: ReadonlyMap<string, string> = new Map(),
   ): void {
     this.miniSearch.removeAll();
+    this.documentsById.clear();
+    this.sync(projections, metadataList, contentByNodeId);
+  }
+
+  /** Update changed documents while preserving the index for unchanged bookmarks. */
+  sync(
+    projections: BookmarkProjection[],
+    metadataList: BookmarkMetadata[],
+    contentByNodeId: ReadonlyMap<string, string> = new Map(),
+  ): void {
     this.docsById.clear();
     this.tagsById.clear();
+    this.parentsById.clear();
 
     for (const meta of metadataList) {
       this.tagsById.set(meta.nodeId, meta.tags);
     }
 
-    const docs: IndexedBookmarkDoc[] = [];
+    const nextIds = new Set<string>();
     for (const p of projections) {
+      this.parentsById.set(p.nodeId, p.parentId);
       if (p.isFolder) continue;
+      nextIds.add(p.nodeId);
       this.docsById.set(p.nodeId, p);
       const tags = this.tagsById.get(p.nodeId) ?? [];
-      docs.push({
+      const doc: IndexedBookmarkDoc = {
         id: p.nodeId,
         title: p.title,
         domain: p.domain,
         path: p.path,
         tags: tags.join(' '),
         url: p.url ?? '',
-      });
+        content: contentByNodeId.get(p.nodeId) ?? '',
+      };
+      const previous = this.documentsById.get(p.nodeId);
+      if (!previous) this.miniSearch.add(doc);
+      else if (JSON.stringify(previous) !== JSON.stringify(doc)) this.miniSearch.replace(doc);
+      this.documentsById.set(p.nodeId, doc);
     }
-
-    this.miniSearch.addAll(docs);
+    for (const [id, document] of this.documentsById) {
+      if (nextIds.has(id)) continue;
+      this.miniSearch.remove(document);
+      this.documentsById.delete(id);
+    }
   }
 
   search(filter: SearchFilter): BookmarkProjection[] {
-    const rawQuery = (filter.query ?? '').trim();
-    let exactDomain = filter.exactDomain?.trim().toLowerCase() ?? '';
-    let tagFilter = filter.tag?.trim().toLowerCase() ?? '';
+    return this.searchRanked(filter).map((match) => match.bookmark);
+  }
 
-    // Parse inline `domain:example.com` and `tag:foo` syntax from query
-    const remainingParts: string[] = [];
-    for (const part of rawQuery.split(/\s+/).filter(Boolean)) {
-      if (part.toLowerCase().startsWith('domain:')) {
-        exactDomain = part.slice(7).toLowerCase();
-      } else if (part.toLowerCase().startsWith('tag:')) {
-        tagFilter = part.slice(4).toLowerCase();
-      } else {
-        remainingParts.push(part);
-      }
-    }
-
-    const textQuery = remainingParts.join(' ').trim();
-
-    let candidates: BookmarkProjection[];
+  searchRanked(filter: SearchFilter): RankedBookmarkMatch[] {
+    const { textQuery, exactDomain, tagFilter } = parseBookmarkSearchFilter(filter);
+    let candidates: RankedBookmarkMatch[];
     if (textQuery) {
       const results = this.miniSearch.search(textQuery);
       candidates = [];
       for (const r of results) {
         const doc = this.docsById.get(r.id);
-        if (doc) candidates.push(doc);
+        if (doc) candidates.push({
+          bookmark: doc,
+          score: r.score,
+          matchedFields: Array.from(new Set(Object.values(r.match).flat())),
+        });
       }
     } else {
-      candidates = Array.from(this.docsById.values());
+      candidates = Array.from(this.docsById.values(), (bookmark) => ({
+        bookmark, score: 0, matchedFields: [],
+      }));
     }
 
     if (exactDomain) {
       candidates = candidates.filter(
-        (b) => b.domain === exactDomain || b.domain.endsWith(`.${exactDomain}`),
+        ({ bookmark: b }) => b.domain === exactDomain || b.domain.endsWith(`.${exactDomain}`),
       );
     }
 
     if (tagFilter) {
-      candidates = candidates.filter((b) =>
+      candidates = candidates.filter(({ bookmark: b }) =>
         (this.tagsById.get(b.nodeId) ?? []).some(
           (t) => t.toLowerCase() === tagFilter,
         ),
@@ -154,7 +195,18 @@ export class BookmarkSearchIndex {
     }
 
     if (filter.folderId) {
-      candidates = candidates.filter((b) => b.parentId === filter.folderId);
+      const folderId = filter.folderId;
+      candidates = candidates.filter(({ bookmark }) => {
+        let parentId = bookmark.parentId;
+        const visited = new Set<string>();
+        while (parentId && !visited.has(parentId)) {
+          if (parentId === folderId) return true;
+          if (!filter.includeDescendants) return false;
+          visited.add(parentId);
+          parentId = this.parentsById.get(parentId) ?? '';
+        }
+        return false;
+      });
     }
 
     return candidates;

@@ -12,7 +12,7 @@ async function loadEncoder(assetBase: string): Promise<FeatureExtractionPipeline
   const modelBase = new URL('semantic-models/', assetBase);
   const config = await fetch(new URL(`${SEMANTIC_MODEL_ID}/config.json`, modelBase)).catch(() => null);
   if (!config?.ok) {
-    throw new Error('未找到本機語意模型。請執行 npm run prepare:semantic-model 後重新打包。');
+    throw new Error('本機模型資產不完整。請重新安裝完整的 Favorsite，或先使用關鍵字搜尋及離線規則。');
   }
 
   env.allowRemoteModels = false;
