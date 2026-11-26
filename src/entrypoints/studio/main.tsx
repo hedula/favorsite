@@ -10,7 +10,8 @@ import {
 import { findDuplicateGroups } from '@/core/duplicates';
 import {
   collectAllowedDestinationIds,
-  isDuplicateCleanupInstruction,
+  getDuplicateInstructionIntent,
+  isDomainGroupingInstruction,
 } from '@/core/planner';
 import {
   collectCheckableOrigins,
@@ -25,8 +26,10 @@ import {
   requestChromePromptApiPlan,
   type PromptApiStatus,
 } from '@/core/prompt-api';
-import { sendStudioMessage, type BootstrapState } from '@/core/protocol';
+import { requestDuplicateDeletion, sendStudioMessage, type BootstrapState } from '@/core/protocol';
 import { BookmarkSearchIndex } from '@/core/search';
+import { buildSemanticDraft, type SemanticDraft } from '@/core/semantic-classifier';
+import { embedWithTransformers } from '@/core/semantic-client';
 import type {
   AiProviderPreference,
   AppSettings,
@@ -97,13 +100,31 @@ function StudioApp() {
   const [banner, setBanner] = useState<{
     kind: 'ok' | 'warn' | 'danger';
     text: string;
+    restoreJobId?: string;
   } | null>(null);
 
   const searchIndexRef = useRef(new BookmarkSearchIndex());
+  const shellRef = useRef<HTMLDivElement>(null);
+  const topbarRef = useRef<HTMLElement>(null);
   const leftToggleRef = useRef<HTMLButtonElement | null>(null);
   const rightToggleRef = useRef<HTMLButtonElement | null>(null);
   const promptPoolRef = useRef(new PromptApiSessionPool());
   const aiAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    const topbar = topbarRef.current;
+    if (!shell || !topbar) return;
+
+    const syncTopbarHeight = () => {
+      const height = topbar.getBoundingClientRect().height;
+      shell.style.setProperty('--studio-topbar-height', `${height}px`);
+    };
+    syncTopbarHeight();
+    const observer = new ResizeObserver(syncTopbarHeight);
+    observer.observe(topbar, { box: 'border-box' });
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const pool = promptPoolRef.current;
@@ -332,6 +353,77 @@ function StudioApp() {
     }
   };
 
+  const showDeletionResult = (job: ExecutionJob, label: string) => {
+    const removedIds = new Set<string>();
+    for (const step of job.steps) {
+      if (step.status === 'applied' && step.intent.type === 'removeBookmark') {
+        removedIds.add(step.intent.nodeId);
+      }
+    }
+    if (removedIds.size > 0) {
+      setSelectedIds((ids) => new Set([...ids].filter((id) => !removedIds.has(id))));
+      setActiveNodeId((id) => id && removedIds.has(id) ? null : id);
+    }
+
+    const removed = removedIds.size;
+    const summary = removed > 0 ? `已刪除 ${removed} 筆${label}，已備份。` : '這次沒有刪除書籤。';
+    const completed = job.status === 'completed';
+    setBanner({
+      kind: completed && removed > 0 ? 'ok' : 'warn',
+      text: completed
+        ? summary
+        : `${summary}${job.conflicts[0]?.message ?? '刪除已暫停，可在「歷程與備份」查看。'}`,
+      restoreJobId: removed > 0 ? job.jobId : undefined,
+    });
+  };
+
+  const handleDeleteNode = async (node: BookmarkProjection) => {
+    if (node.isFolder && !window.confirm(`確定要移除資料夾「${node.title}」及其內部項目？移除前會備份。`)) {
+      return;
+    }
+    const result = await runAction(() =>
+      sendStudioMessage({
+        type: 'REMOVE_BOOKMARK',
+        payload: { nodeId: node.nodeId, recursive: node.isFolder },
+      }),
+    );
+    if (!result) return;
+    if (result.job) {
+      showDeletionResult(result.job, '書籤');
+    } else {
+      setActiveNodeId((id) => id === node.nodeId ? null : id);
+      const kind = node.isFolder ? '資料夾' : '書籤';
+      setBanner({ kind: 'ok', text: `已移除${kind}「${node.title}」，已備份。` });
+    }
+  };
+
+  const handleDeleteDuplicates = async (scope: PlanScope) => {
+    setActivePlan(null);
+    setLastAppliedJob(null);
+    const job = await runAction(() =>
+      requestDuplicateDeletion({ ...scope, targetFolderIds: [] }),
+    );
+    if (job) {
+      showDeletionResult(job, '重複書籤');
+    } else if (job === null) {
+      setBanner({ kind: 'warn', text: '目前範圍沒有可刪除的完全重複書籤。' });
+    }
+  };
+
+  const handleRestoreJob = async (jobId: string) => {
+    const job = await runAction(() =>
+      sendStudioMessage({ type: 'RESTORE_JOB', payload: { jobId } }),
+    );
+    if (!job) return;
+    setLastAppliedJob(job);
+    setBanner({
+      kind: job.conflicts.length > 0 ? 'warn' : 'ok',
+      text: job.conflicts.length > 0
+        ? `復原完成，但有 ${job.conflicts.length} 筆因後續修改保留現狀。`
+        : '已完整復原此批次的所有書籤與標籤變更。',
+    });
+  };
+
   const handleToggleSelect = (nodeId: string, shiftKey: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -510,10 +602,11 @@ function StudioApp() {
   const interruptedJob = state?.jobs.find(
     (j) => j.status === 'interrupted' || j.status === 'paused_conflict',
   );
+  const restoreJobId = banner?.restoreJobId;
 
   return (
-    <div className="studio-shell">
-      <header className="studio-topbar">
+    <div ref={shellRef} className="studio-shell">
+      <header ref={topbarRef} className="studio-topbar">
         <div className="studio-topbar-inner">
           <div className="studio-brand">
             <div className="brand-mark">
@@ -610,6 +703,16 @@ function StudioApp() {
             role={banner.kind === 'danger' ? 'alert' : 'status'}
           >
             <span>{banner.text}</span>
+            {restoreJobId && (
+              <button
+                type="button"
+                className="surface-btn sm"
+                disabled={busy}
+                onClick={() => void handleRestoreJob(restoreJobId)}
+              >
+                復原此批次
+              </button>
+            )}
             <button
               type="button"
               className="surface-btn sm"
@@ -643,15 +746,7 @@ function StudioApp() {
               setLastAppliedJob(res);
             }, '已嘗試續跑剩餘項目，請檢視最新狀態。');
           }}
-          onRestoreJob={async (jobId) => {
-            await runAction(async () => {
-              const res = await sendStudioMessage({
-                type: 'RESTORE_JOB',
-                payload: { jobId },
-              });
-              setLastAppliedJob(res);
-            }, '已完成批次復原。');
-          }}
+          onRestoreJob={handleRestoreJob}
           onResolveStep={async (params) => {
             await runAction(async () => {
               await sendStudioMessage({ type: 'RESOLVE_JOB_STEP', payload: params });
@@ -866,20 +961,8 @@ function StudioApp() {
                     '已更新書籤位置。',
                   );
                 }}
-                onDeleteItem={(node) => {
-                  const msg = node.isFolder
-                    ? `確定要移除資料夾「${node.title}」及其內部項目？移除前會自動保存可重建快照。`
-                    : `確定要移除書籤「${node.title}」？移除前會自動保存快照。`;
-                  if (!window.confirm(msg)) return;
-                  void runAction(
-                    () =>
-                      sendStudioMessage({
-                        type: 'REMOVE_BOOKMARK',
-                        payload: { nodeId: node.nodeId, recursive: node.isFolder },
-                      }),
-                    `已移除「${node.title}」（已保留快照）。`,
-                  );
-                }}
+                onDeleteItem={(node) => void handleDeleteNode(node)}
+                onExportBackup={() => void handleExportBackup()}
                 onOpenCreateForm={(kind) => {
                   setCreateKind(kind);
                   setRightMode('create');
@@ -901,25 +984,9 @@ function StudioApp() {
                   handleCheckLinks(targets);
                 }}
                 onBatchMove={(destId) => void handleBatchMovePreview(destId)}
-                onGenerateDuplicatePlan={() => {
-                  void (async () => {
-                    const plan = await runAction(
-                      () =>
-                        sendStudioMessage({
-                          type: 'CREATE_DUPLICATE_PLAN',
-                          payload: { scope: { type: 'all', targetFolderIds: [] } },
-                        }),
-                      '已產生重複書籤清理預覽（尚未修改 Chrome 書籤）。',
-                    );
-                    if (plan) {
-                      setActivePlan(plan);
-                      setLastAppliedJob(null);
-                      setRightMode('organize');
-                      setTabletRightOpen(true);
-                      setMobilePane('inspector');
-                    }
-                  })();
-                }}
+                onDeleteDuplicates={() =>
+                  void handleDeleteDuplicates({ type: 'all', targetFolderIds: [] })
+                }
               />
             </main>
 
@@ -975,20 +1042,8 @@ function StudioApp() {
                     }
                   }, '已儲存書籤與標籤變更。');
                 }}
-                onDeleteNode={async (node) => {
-                  if (!window.confirm(`確定要移除「${node.title}」？將先保存快照。`)) {
-                    return;
-                  }
-                  await runAction(
-                    () =>
-                      sendStudioMessage({
-                        type: 'REMOVE_BOOKMARK',
-                        payload: { nodeId: node.nodeId, recursive: node.isFolder },
-                      }),
-                    `已移除「${node.title}」（已保留快照）。`,
-                  );
-                  setActiveNodeId(null);
-                }}
+                onDeleteNode={handleDeleteNode}
+                onDeleteDuplicates={handleDeleteDuplicates}
                 onGeneratePlan={async (params: {
                   scope: PlanScope;
                   instruction: string;
@@ -999,18 +1054,42 @@ function StudioApp() {
                     | { draftOps: import('@/core/planner').DraftOperationInput[]; warnings: string[] }
                     | undefined;
                   let precomputedChromeAiError: string | undefined;
+                  let semanticDraft: SemanticDraft | undefined;
+                  const usesRules =
+                    isDomainGroupingInstruction(params.instruction) ||
+                    getDuplicateInstructionIntent(params.instruction) !== null;
 
-                  // When Chrome Prompt API is selected or prioritized ('auto'),
-                  // invoke LanguageModel inside the foreground click gesture so Chrome allows
-                  // on-device Gemini Nano download if availability === 'downloadable'.
-                  // Duplicate cleanup is answered by the deterministic planner in the
-                  // worker; calling the model first would only waste time.
-                  if (
-                    (params.mode === 'auto' ||
-                      params.mode === 'chrome-prompt-api') &&
-                    promptApiStatus?.supported &&
-                    !isDuplicateCleanupInstruction(params.instruction)
-                  ) {
+                  if (params.mode === 'transformers-js' && !usesRules) {
+                    const abortCtrl = new AbortController();
+                    aiAbortRef.current = abortCtrl;
+                    setBusy(true);
+                    setBanner(null);
+                    setIsGeneratingAi(true);
+                    setAiLiveStatus('正在載入本機模型並比對書籤與分類…');
+                    try {
+                      semanticDraft = await buildSemanticDraft({
+                        ...params,
+                        flattened,
+                        metadataByNodeId,
+                        includePath: state.settings.includePathInAi,
+                        embed: (texts) => embedWithTransformers(texts, abortCtrl.signal),
+                      });
+                    } catch (error) {
+                      if (abortCtrl.signal.aborted) {
+                        setAiLiveStatus('已停止產生整理方案。');
+                        setBusy(false);
+                        return;
+                      }
+                      semanticDraft = {
+                        draftOps: [],
+                        warnings: [error instanceof Error ? error.message : String(error)],
+                      };
+                    } finally {
+                      setIsGeneratingAi(false);
+                      aiAbortRef.current = null;
+                    }
+                  } else if (!usesRules && (params.mode === 'auto' || params.mode === 'chrome-prompt-api')) {
+                    // The foreground click can activate Gemini Nano's model download.
                     const { inScopeBookmarks } = collectScopeNodes(
                       flattened,
                       params.scope,
@@ -1020,6 +1099,7 @@ function StudioApp() {
                       writableFolders,
                       metadataByNodeId,
                       includePath: state.settings.includePathInAi,
+                      baseParentId: params.baseParentId || params.scope.targetFolderIds[0],
                       priorityFolderIds: collectAllowedDestinationIds(
                         flattened,
                         params.scope,
@@ -1027,6 +1107,7 @@ function StudioApp() {
                     });
                     if (batch.bookmarks.length > 0) {
                       setBusy(true);
+                      setBanner(null);
                       setIsGeneratingAi(true);
                       setAiLiveStatus('正在使用 Chrome 內建 Gemini Nano 產生整理建議…');
                       const abortCtrl = new AbortController();
@@ -1059,7 +1140,7 @@ function StudioApp() {
                         }
                         precomputedChromeAiError =
                           err instanceof Error ? err.message : String(err);
-                        setAiLiveStatus('Chrome 內建模型無法完成推理，將自動切換至降級模式。');
+                        setAiLiveStatus('正在檢查本機規則能否處理這項指令…');
                       } finally {
                         setAiDownloadFraction(null);
                         setIsGeneratingAi(false);
@@ -1076,14 +1157,28 @@ function StudioApp() {
                           ...params,
                           precomputedChromeAiDraft,
                           precomputedChromeAiError,
+                          semanticDraft,
                         },
                       }),
-                    '已產生整理方案預覽（尚未修改 Chrome 書籤）。',
                   );
                   if (plan) {
                     setActivePlan(plan);
                     setLastAppliedJob(null);
                     setAiLiveStatus('');
+                    const enabledCount = plan.operations.filter((op) => op.enabled).length;
+                    if (enabledCount > 0) {
+                      setBanner({
+                        kind: 'ok',
+                        text: `已產生 ${enabledCount} 項可套用的變更。檢查差異後按「確認套用」。`,
+                      });
+                    } else {
+                      setBanner({
+                        kind: 'warn',
+                        text: plan.operations.length > 0
+                          ? '請在差異預覽勾選要套用的變更。'
+                          : '這次沒有可套用的變更。請查看差異預覽。',
+                      });
+                    }
                   }
                 }}
                 onCheckLinksInScope={(scope) => {
@@ -1141,21 +1236,7 @@ function StudioApp() {
                   setActivePlan(null);
                   setBanner({ kind: 'ok', text: '已取消整理方案，書籤與標籤未變動。' });
                 }}
-                onRestoreJob={async (jobId) => {
-                  const job = await runAction(() =>
-                    sendStudioMessage({ type: 'RESTORE_JOB', payload: { jobId } }),
-                  );
-                  if (job) {
-                    setLastAppliedJob(job);
-                    setBanner({
-                      kind: job.conflicts.length > 0 ? 'warn' : 'ok',
-                      text:
-                        job.conflicts.length > 0
-                          ? `復原完成，但有 ${job.conflicts.length} 筆因後續修改保留現狀。`
-                          : '已完整復原此批次的所有書籤與標籤變更。',
-                    });
-                  }
-                }}
+                onRestoreJob={handleRestoreJob}
               />
             </aside>
           </div>

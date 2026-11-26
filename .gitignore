@@ -3,6 +3,7 @@ node_modules/
 .wxt/
 playwright-report/
 test-results/
+public/semantic-models/
 .DS_Store
 *.zip
 

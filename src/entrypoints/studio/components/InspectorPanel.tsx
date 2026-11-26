@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   enableDead404Removals,
   getDependentOperations,
+  getDuplicateInstructionIntent,
   overrideMoveDestination,
   togglePlanOperation,
   type DeadLinkCleanupAction,
@@ -23,6 +24,7 @@ export type RightPaneMode = 'inspect' | 'create' | 'organize';
 
 const PLAN_SOURCE_LABEL: Record<PlanSource, string> = {
   'chrome-prompt-api': 'Chrome 內建 AI (Gemini Nano)',
+  'transformers-js': '本機語意分類（Transformers.js）',
   rule: '本機離線規則',
   manual: '手動批次',
 };
@@ -59,6 +61,7 @@ interface InspectorPanelProps {
     newParentId?: string;
   }) => Promise<void>;
   onDeleteNode: (node: BookmarkProjection) => Promise<void>;
+  onDeleteDuplicates: (scope: PlanScope) => Promise<void>;
   onGeneratePlan: (params: {
     scope: PlanScope;
     instruction: string;
@@ -101,6 +104,7 @@ export function InspectorPanel({
   onCreateNode,
   onSaveNode,
   onDeleteNode,
+  onDeleteDuplicates,
   onGeneratePlan,
   onCheckLinksInScope,
   onGenerateDeadLinkPlan,
@@ -123,6 +127,7 @@ export function InspectorPanel({
 
   // Organize form state
   const [instruction, setInstruction] = useState('');
+  const isDuplicateCleanup = getDuplicateInstructionIntent(instruction) === 'cleanup';
   const [orgMode, setOrgMode] = useState<AiProviderPreference>(
     settings.aiProvider || 'auto',
   );
@@ -133,6 +138,16 @@ export function InspectorPanel({
   const [includeUnreachable, setIncludeUnreachable] = useState(false);
   const generateBtnRef = useRef<HTMLButtonElement | null>(null);
   const stopBtnRef = useRef<HTMLButtonElement | null>(null);
+  const previewRef = useRef<HTMLElement | null>(null);
+  const previewPlanId = activePlan?.planId;
+  const isDuplicatePreview = activePlan !== null &&
+    getDuplicateInstructionIntent(activePlan.instruction) !== null;
+
+  useEffect(() => {
+    if (!previewPlanId) return;
+    previewRef.current?.focus({ preventScroll: true });
+    previewRef.current?.scrollIntoView({ block: 'start' });
+  }, [previewPlanId]);
 
   useEffect(() => {
     setOrgMode(settings.aiProvider || 'auto');
@@ -403,7 +418,7 @@ export function InspectorPanel({
                   disabled={busy}
                   onClick={() => void onDeleteNode(activeNode)}
                 >
-                  移除（保留快照）
+                  刪除
                 </button>
               )}
             </div>
@@ -492,9 +507,15 @@ export function InspectorPanel({
               <option value="chrome-prompt-api">
                 Chrome Prompt API (Gemini Nano · 不支援時自動降級)
               </option>
+              <option value="transformers-js">本機語意分類（Transformers.js）</option>
               <option value="rule">純本機離線規則（不呼叫模型）</option>
             </select>
-            {promptApiStatus && (
+            {orgMode === 'transformers-js' && (
+              <p className="wf-muted" style={{ margin: 0 }}>
+                請指定至少兩個分類，例如「依 KV、R2 分類」。分類依據不足的書籤會保留原位。
+              </p>
+            )}
+            {promptApiStatus && orgMode !== 'transformers-js' && (
               <div
                 className={`ai-status-box ${promptApiStatus.supported ? '' : 'degraded'}`}
               >
@@ -578,24 +599,36 @@ export function InspectorPanel({
             </div>
           </div>
 
+          {isDuplicateCleanup && (
+            <div className="wf-muted">
+              刪除目前範圍內網址完全相同的副本，每組保留最早加入的一筆。刪除前會備份。
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button
               ref={generateBtnRef}
               type="button"
-              className="primary"
+              className={isDuplicateCleanup ? 'danger' : 'primary'}
               style={{ flex: 1, minHeight: 42, fontWeight: 600 }}
               disabled={busy}
-              onClick={() =>
+              onClick={() => {
+                const scope = computeCurrentScope();
+                if (isDuplicateCleanup) {
+                  void onDeleteDuplicates(scope);
+                  return;
+                }
                 void onGeneratePlan({
-                  scope: computeCurrentScope(),
+                  scope,
                   instruction,
                   mode: orgMode,
                   baseParentId,
-                })
-              }
+                });
+              }}
             >
               <IconBolt size={16} />
-              {busy ? '正在產生預覽…' : '產生整理預覽方案'}
+              {isDuplicateCleanup
+                ? '刪除重複書籤'
+                : busy ? '正在產生預覽…' : '產生整理預覽方案'}
             </button>
             {isGeneratingAi && (
               <button
@@ -710,7 +743,7 @@ export function InspectorPanel({
         )}
 
         {activePlan && (
-          <section className="section-box" aria-label="方案差異預覽">
+          <section ref={previewRef} className="section-box plan-preview" aria-label="方案差異預覽" tabIndex={-1}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
               <strong>
                 差異預覽 (v{activePlan.revision} · 已勾選 {enabledCount}/{activePlan.operations.length})
@@ -720,6 +753,22 @@ export function InspectorPanel({
                 {activePlan.fallbackFrom ? ' (已降級)' : ''}
               </span>
             </div>
+
+            {activePlan.operations.length > 0 && (
+              <div className="plan-preview-actions">
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={busy || enabledCount === 0 || isPlanStale}
+                  onClick={() => void onApplyPlan(activePlan)}
+                >
+                  確認套用 ({enabledCount} 筆 · v{activePlan.revision})
+                </button>
+                <button type="button" disabled={busy} onClick={onCancelPlan}>
+                  取消方案
+                </button>
+              </div>
+            )}
 
             {isPlanStale && (
               <div className="wf-banner danger" role="alert">
@@ -755,11 +804,12 @@ export function InspectorPanel({
               </div>
             )}
 
-            {activePlan.operations.length === 0 ? (
+            {activePlan.operations.length === 0 && !isDuplicatePreview && (
               <p className="wf-muted">
                 目前條件未產生任何變更建議。請調整範圍或輸入更明確的分類關鍵字。
               </p>
-            ) : (
+            )}
+            {activePlan.operations.length > 0 && (
               <>
                 {createOps.length > 0 && (
                   <div className="op-group">
@@ -1116,20 +1166,6 @@ export function InspectorPanel({
                     })}
                   </div>
                 )}
-
-                <div style={{ display: 'flex', gap: 8, paddingTop: 6 }}>
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={busy || enabledCount === 0 || isPlanStale}
-                    onClick={() => void onApplyPlan(activePlan)}
-                  >
-                    確認套用 ({enabledCount} 筆 · v{activePlan.revision})
-                  </button>
-                  <button type="button" disabled={busy} onClick={onCancelPlan}>
-                    取消方案
-                  </button>
-                </div>
               </>
             )}
           </section>

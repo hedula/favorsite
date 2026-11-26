@@ -2,6 +2,7 @@ import { orchestrateOrganizePlan } from '@/core/ai-orchestrator';
 import { exportBackupPayload, restoreBackupToFolder } from '@/core/backup';
 import {
   buildProjections,
+  computeScopeFingerprint,
   createChromeBookmarkAdapter,
   extractFullSnapshotNodes,
   extractSnapshotNodes,
@@ -19,8 +20,10 @@ import { runBatchLinkCheck } from '@/core/link-checker';
 import {
   generateDeadLinkCleanupPlan,
   generateDuplicateCleanupPlan,
+  getDirectDuplicateOperations,
 } from '@/core/planner';
 import {
+  UNKNOWN_STUDIO_MESSAGE,
   isTrustedExtensionSender,
   summarizeSnapshot,
   validateStudioMessage,
@@ -29,11 +32,12 @@ import {
   type StudioResponse,
 } from '@/core/protocol';
 import { defaultStore } from '@/core/store';
-import type { BookmarkMetadata, Snapshot } from '@/core/types';
+import type { BookmarkApiAdapter, BookmarkMetadata, OrganizePlan, Snapshot } from '@/core/types';
 
 // Ephemeral guard ONLY to tell whether a 'running'/'restoring' job is live in THIS SW turn
 // vs orphaned by a terminated SW (persisted truth remains in IndexedDB).
 const liveWorkerJobIds = new Set<string>();
+let directDeletionsInProgress = 0;
 
 function makeSnapshotId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -51,6 +55,31 @@ async function notifyBookmarkChange(reason: string): Promise<void> {
     });
   } catch {
     // No open extension pages listening — expected when Studio/Popup are closed
+  }
+}
+
+async function applyDirectDeletion(
+  adapter: BookmarkApiAdapter,
+  snapshot: Snapshot,
+  plan: OrganizePlan,
+) {
+  const settings = await defaultStore.getSettings(plan.profileKey);
+  await defaultStore.saveSnapshot(snapshot);
+  await defaultStore.savePlan(plan);
+  directDeletionsInProgress++;
+  try {
+    const job = await applyApprovedPlan({
+      adapter,
+      store: defaultStore,
+      plan,
+      approvedRevision: plan.revision,
+    });
+    // Retention cleanup must not conceal the result of a committed deletion.
+    await defaultStore.pruneSnapshots(plan.profileKey, settings.backupRetentionCount).catch(() => {});
+    return job;
+  } finally {
+    directDeletionsInProgress--;
+    await notifyBookmarkChange('removed');
   }
 }
 
@@ -263,9 +292,39 @@ async function handleStudioMessage(
         nodes: extractFullSnapshotNodes(flattened),
         metadata: allMeta,
       };
-      await defaultStore.saveSnapshot(snapshot);
+      if (!node.isFolder) {
+        const plan: OrganizePlan = {
+          planId: `plan_${snapshot.snapshotId}`,
+          profileKey,
+          revision: 1,
+          snapshotId: snapshot.snapshotId,
+          scope: snapshot.scope,
+          scopeFingerprint: computeScopeFingerprint(flattened, snapshot.scope),
+          instruction: `刪除書籤「${node.title || node.url}」`,
+          source: 'manual',
+          operations: [{
+            opId: 'delete-bookmark',
+            type: 'removeBookmark',
+            enabled: true,
+            reason: '手動刪除書籤',
+            nodeId: node.nodeId,
+            bookmarkTitle: node.title,
+            bookmarkUrl: node.url,
+            parentId: node.parentId,
+            index: node.index,
+            path: node.path,
+          }],
+          status: 'draft',
+          warnings: [],
+          createdAt: snapshot.createdAt,
+          updatedAt: snapshot.createdAt,
+        };
+        const job = await applyDirectDeletion(adapter, snapshot, plan);
+        return { ok: true, data: { snapshotId: snapshot.snapshotId, job } };
+      }
 
-      if (node.isFolder && recursive) {
+      await defaultStore.saveSnapshot(snapshot);
+      if (recursive) {
         await adapter.removeTree(nodeId);
       } else {
         await adapter.remove(nodeId);
@@ -307,6 +366,7 @@ async function handleStudioMessage(
         baseParentId,
         precomputedChromeAiDraft,
         precomputedChromeAiError,
+        semanticDraft,
       } = message.payload;
       const { flattened } = await refreshProjections();
       const allMeta = await defaultStore.getAllMetadata(profileKey);
@@ -341,6 +401,7 @@ async function handleStudioMessage(
         settings,
         precomputedChromeAiDraft,
         precomputedChromeAiError,
+        semanticDraft,
       });
 
       await defaultStore.savePlan(plan);
@@ -516,36 +577,49 @@ async function handleStudioMessage(
       return { ok: true, data: plan };
     }
 
-    case 'CREATE_DUPLICATE_PLAN': {
+    case 'CREATE_DUPLICATE_PLAN':
+    case 'DELETE_DUPLICATES': {
+      const applyImmediately = message.type === 'DELETE_DUPLICATES';
       const { scope } = message.payload;
       const { flattened } = await refreshProjections();
       const allMeta = await defaultStore.getAllMetadata(profileKey);
       const metaMap = new Map<string, BookmarkMetadata>(
         allMeta.map((m) => [m.nodeId, m]),
       );
-      const snapshot: Snapshot = {
-        snapshotId: makeSnapshotId(),
-        schemaVersion: 1,
-        profileKey,
-        createdAt: Date.now(),
-        reason: 'delete',
-        label: '重複書籤清理前快照',
-        scope,
-        nodes: extractFullSnapshotNodes(flattened),
-        metadata: allMeta,
-      };
-      await defaultStore.saveSnapshot(snapshot);
+      const snapshotId = makeSnapshotId();
       const plan = generateDuplicateCleanupPlan({
         flattened,
         scope,
         metadataByNodeId: metaMap,
         profileKey,
-        snapshotId: snapshot.snapshotId,
+        snapshotId,
+        instruction: '刪除重複書籤',
       });
-      await defaultStore.savePlan(plan);
-      const settings = await defaultStore.getSettings(profileKey);
-      await defaultStore.pruneSnapshots(profileKey, settings.backupRetentionCount);
-      return { ok: true, data: plan };
+      if (applyImmediately) {
+        plan.operations = getDirectDuplicateOperations(plan.operations);
+        if (plan.operations.length === 0) return { ok: true, data: null };
+      }
+
+      const snapshot: Snapshot = {
+        snapshotId,
+        schemaVersion: 1,
+        profileKey,
+        createdAt: plan.createdAt,
+        reason: 'delete',
+        label: '重複書籤刪除前備份',
+        scope,
+        nodes: extractFullSnapshotNodes(flattened),
+        metadata: allMeta,
+      };
+      if (!applyImmediately) {
+        await defaultStore.saveSnapshot(snapshot);
+        await defaultStore.savePlan(plan);
+        const settings = await defaultStore.getSettings(profileKey);
+        await defaultStore.pruneSnapshots(profileKey, settings.backupRetentionCount);
+        return { ok: true, data: plan };
+      }
+      const job = await applyDirectDeletion(adapter, snapshot, plan);
+      return { ok: true, data: job };
     }
 
     case 'OPEN_STUDIO': {
@@ -554,7 +628,7 @@ async function handleStudioMessage(
     }
 
     default:
-      return { ok: false, error: '未知的訊息類型。' };
+      return { ok: false, error: UNKNOWN_STUDIO_MESSAGE };
   }
 }
 
@@ -594,7 +668,7 @@ export default defineBackground(() => {
     void notifyBookmarkChange('chrome_moved');
   });
   chrome.bookmarks.onRemoved.addListener(() => {
-    void notifyBookmarkChange('chrome_removed');
+    if (directDeletionsInProgress === 0) void notifyBookmarkChange('chrome_removed');
   });
   chrome.bookmarks.onChildrenReordered.addListener(() => {
     void notifyBookmarkChange('chrome_reordered');

@@ -363,7 +363,7 @@ export async function applyApprovedPlan(
           {
             kind: 'scope_changed',
             message:
-              '預覽後書籤或資料夾順序已發生外部變更，已暫停套用。請重新預覽最新狀態。',
+              '書籤或資料夾順序已發生外部變更，已暫停套用。請先檢查最新的書籤狀態。',
           },
         ];
         job.updatedAt = Date.now();
@@ -731,8 +731,23 @@ export async function applyApprovedPlan(
             resultCode: 'NODE_MODIFIED',
             kind: 'node_modified',
             nodeId: intent.nodeId,
-            message: `書籤「${intent.bookmarkTitle}」的網址或位置在預覽後已變更，已暫停移除`,
+            message: `書籤「${intent.bookmarkTitle}」的網址或位置已變更，已暫停移除。`,
           });
+        }
+
+        if (intent.removalKind === 'duplicate_exact' && intent.keepNodeId) {
+          const keeper = liveFlattened.byId.get(intent.keepNodeId);
+          if (!keeper || keeper.url !== liveNode.url) {
+            return pauseStepOnConflict({
+              store,
+              job,
+              step,
+              resultCode: 'DUPLICATE_KEEPER_CHANGED',
+              kind: 'node_modified',
+              nodeId: intent.keepNodeId,
+              message: `要保留的書籤「${intent.keepTitle || intent.bookmarkTitle}」已變更或遺失，請核對後再操作。`,
+            });
+          }
         }
 
         const existingMeta = await store.getMetadata(profileKey, liveNode.nodeId);

@@ -859,6 +859,18 @@ code {
   color: var(--md-on-surface);
 }
 
+.plan-preview-actions {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-block: 8px;
+  background: var(--md-surface-lowest);
+  border-bottom: 1px solid var(--md-surface-container);
+}
+
 .tonal-well {
   background: var(--md-surface-low);
   border-radius: 12px;
@@ -1127,6 +1139,18 @@ code {
   .pane-center.mobile-active,
   .pane-right.mobile-active {
     display: flex;
+  }
+
+  .pane-right {
+    overflow: visible;
+  }
+
+  .plan-preview {
+    scroll-margin-top: var(--studio-topbar-height, 0px);
+  }
+
+  .plan-preview-actions {
+    top: var(--studio-topbar-height, 0px);
   }
 
   button {

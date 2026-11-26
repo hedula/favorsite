@@ -1,6 +1,11 @@
 import type { RestoreBackupResult } from './backup';
 import type { BatchLinkCheckResult } from './link-checker';
-import type { DeadLinkCleanupAction, DraftOperationInput } from './planner';
+import {
+  getDirectDuplicateOperations,
+  type DeadLinkCleanupAction,
+  type DraftOperationInput,
+} from './planner';
+import type { SemanticDraft } from './semantic-classifier';
 import type {
   AiProviderPreference,
   AppSettings,
@@ -14,6 +19,12 @@ import type {
   Snapshot,
   SnapshotSummary,
 } from './types';
+
+export const UNKNOWN_STUDIO_MESSAGE = '未知的訊息類型。';
+const BACKGROUND_UPDATE_REQUIRED =
+  'Favorsite 的背景程式需要更新。請到 chrome://extensions 重新載入 Favorsite，再重開工作台。';
+
+class UnsupportedStudioMessageError extends Error {}
 
 export type StudioMessage =
   | { type: 'GET_BOOTSTRAP_STATE' }
@@ -56,6 +67,7 @@ export type StudioMessage =
           warnings: string[];
         };
         precomputedChromeAiError?: string;
+        semanticDraft?: SemanticDraft;
       };
     }
   | {
@@ -107,7 +119,7 @@ export type StudioMessage =
       };
     }
   | {
-      type: 'CREATE_DUPLICATE_PLAN';
+      type: 'DELETE_DUPLICATES' | 'CREATE_DUPLICATE_PLAN';
       payload: { scope: PlanScope };
     }
   | {
@@ -149,10 +161,12 @@ const isObj = (v: unknown): v is Record<string, unknown> =>
 
 function isValidScope(v: unknown): boolean {
   if (!isObj(v)) return false;
-  if (!['folder', 'selection', 'all'].includes(String(v.type))) return false;
   if (!isStrArray(v.targetFolderIds, 1000)) return false;
   if (!isOptStr(v.folderId)) return false;
-  return v.bookmarkIds === undefined || isStrArray(v.bookmarkIds);
+  if (v.bookmarkIds !== undefined && !isStrArray(v.bookmarkIds)) return false;
+  if (v.type === 'folder') return Boolean(v.folderId);
+  if (v.type === 'selection') return v.bookmarkIds !== undefined;
+  return v.type === 'all';
 }
 
 /**
@@ -203,9 +217,15 @@ export function validateStudioMessage(message: unknown): string | null {
       return isObj(p) &&
         isValidScope(p.scope) &&
         isStr(p.instruction) &&
-        ['auto', 'chrome-prompt-api', 'rule'].includes(String(p.mode)) &&
+        ['auto', 'chrome-prompt-api', 'transformers-js', 'rule'].includes(String(p.mode)) &&
         isOptStr(p.baseParentId) &&
         isOptStr(p.precomputedChromeAiError) &&
+        (p.semanticDraft === undefined ||
+          (isObj(p.semanticDraft) &&
+            Array.isArray(p.semanticDraft.draftOps) &&
+            isStrArray(p.semanticDraft.warnings, 1000) &&
+            (p.semanticDraft.backend === undefined ||
+              p.semanticDraft.backend === 'webgpu' || p.semanticDraft.backend === 'wasm'))) &&
         (p.precomputedChromeAiDraft === undefined ||
           (isObj(p.precomputedChromeAiDraft) &&
             Array.isArray(p.precomputedChromeAiDraft.draftOps) &&
@@ -254,10 +274,11 @@ export function validateStudioMessage(message: unknown): string | null {
         (p.includeUnreachable === undefined || typeof p.includeUnreachable === 'boolean')
         ? null
         : bad;
+    case 'DELETE_DUPLICATES':
     case 'CREATE_DUPLICATE_PLAN':
       return isObj(p) && isValidScope(p.scope) ? null : bad;
     default:
-      return '未知的訊息類型。';
+      return UNKNOWN_STUDIO_MESSAGE;
   }
 }
 
@@ -271,7 +292,7 @@ export type MessageResponseMap = {
   CREATE_BOOKMARK: { nodeId: string };
   UPDATE_BOOKMARK: { nodeId: string };
   MOVE_BOOKMARK: { nodeId: string };
-  REMOVE_BOOKMARK: { snapshotId: string };
+  REMOVE_BOOKMARK: { snapshotId: string; job?: ExecutionJob };
   UPDATE_TAGS: { nodeId: string; tags: string[] };
   CREATE_PLAN: OrganizePlan;
   SAVE_PLAN: OrganizePlan;
@@ -285,6 +306,7 @@ export type MessageResponseMap = {
   CHECK_LINKS: BatchLinkCheckResult;
   CREATE_DEAD_LINK_PLAN: OrganizePlan;
   CREATE_DUPLICATE_PLAN: OrganizePlan;
+  DELETE_DUPLICATES: ExecutionJob | null;
   OPEN_STUDIO: { opened: boolean };
 };
 
@@ -310,7 +332,45 @@ export async function sendStudioMessage<M extends StudioMessage>(
     throw new Error('擴充功能背景服務無回應，請重新整理頁面。');
   }
   if (!res.ok) {
+    if (res.error === UNKNOWN_STUDIO_MESSAGE) {
+      throw new UnsupportedStudioMessageError(res.error);
+    }
     throw new Error(res.error || '操作失敗');
   }
   return res.data;
+}
+
+export async function requestDuplicateDeletion(scope: PlanScope): Promise<ExecutionJob | null> {
+  if (!isValidScope(scope)) throw new Error('請重新選擇要清理的書籤範圍。');
+  try {
+    return await sendStudioMessage({ type: 'DELETE_DUPLICATES', payload: { scope } });
+  } catch (error) {
+    if (!(error instanceof UnsupportedStudioMessageError)) throw error;
+  }
+
+  // Older workers reject the new command before writing any bookmarks.
+  let plan: OrganizePlan;
+  try {
+    plan = await sendStudioMessage({ type: 'CREATE_DUPLICATE_PLAN', payload: { scope } });
+  } catch (error) {
+    if (!(error instanceof UnsupportedStudioMessageError)) throw error;
+    throw new Error(BACKGROUND_UPDATE_REQUIRED);
+  }
+
+  if (!plan?.snapshotId || plan.source !== 'rule' || plan.status !== 'draft' || !Array.isArray(plan.operations)) {
+    throw new Error(BACKGROUND_UPDATE_REQUIRED);
+  }
+  const operations = getDirectDuplicateOperations(plan.operations);
+  if (operations.length === 0) return null;
+  const approved = {
+    ...plan,
+    operations,
+    revision: plan.revision + 1,
+    updatedAt: Date.now(),
+  };
+  await sendStudioMessage({ type: 'SAVE_PLAN', payload: { plan: approved } });
+  return sendStudioMessage({
+    type: 'APPLY_PLAN',
+    payload: { planId: approved.planId, approvedRevision: approved.revision },
+  });
 }

@@ -7,7 +7,7 @@ import type {
 } from '@/core/types';
 import { isLinkCheckCurrent } from '@/core/link-checker';
 import type { SmartViewType } from './FolderTree';
-import { IconFolder, IconGlobe, IconLinkOff, IconSparkles } from './Icons';
+import { IconDownload, IconFolder, IconGlobe, IconLinkOff, IconSparkles } from './Icons';
 
 function renderLinkBadge(linkCheck?: LinkCheckRecord) {
   if (!linkCheck) return null;
@@ -100,11 +100,12 @@ interface BookmarkListProps {
     opts?: { desiredFinalIndex?: number; beforeSiblingId?: string },
   ) => void;
   onDeleteItem: (node: BookmarkProjection) => void;
+  onExportBackup: () => void;
   onOpenCreateForm: (kind: 'bookmark' | 'folder') => void;
   onStartOrganize: () => void;
   onCheckLinks: () => void;
   onBatchMove: (targetFolderId: string) => void;
-  onGenerateDuplicatePlan: () => void;
+  onDeleteDuplicates: () => void;
 }
 
 function formatDate(ts?: number): string {
@@ -138,15 +139,17 @@ export function BookmarkList({
   onActivateNode,
   onMoveItem,
   onDeleteItem,
+  onExportBackup,
   onOpenCreateForm,
   onStartOrganize,
   onCheckLinks,
   onBatchMove,
-  onGenerateDuplicatePlan,
+  onDeleteDuplicates,
 }: BookmarkListProps) {
   const [dragOverRowId, setDragOverRowId] = useState<string | null>(null);
   const [movePickerNodeId, setMovePickerNodeId] = useState<string | null>(null);
   const [batchDestFolderId, setBatchDestFolderId] = useState<string>('');
+  const hasExactDuplicates = duplicateGroups.some((group) => group.kind === 'exact');
   /**
    * Element ids to try (in order) once the list has re-rendered after a move. Moving a
    * row re-orders the DOM and can disable the pressed button (e.g. 上移 at the top), which
@@ -388,10 +391,11 @@ export function BookmarkList({
                 <button
                   type="button"
                   className="sm danger"
-                  aria-label={`移除 ${item.title}`}
+                  aria-label={`刪除 ${item.title}`}
+                  disabled={busy}
                   onClick={() => onDeleteItem(item)}
                 >
-                  移除
+                  刪除
                 </button>
               </>
             )}
@@ -414,6 +418,16 @@ export function BookmarkList({
             </span>
           </h2>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="sm"
+              disabled={busy}
+              title="下載目前 Chrome 設定檔的書籤與標籤"
+              onClick={onExportBackup}
+            >
+              <IconDownload size={14} />
+              備份書籤
+            </button>
             <button
               type="button"
               className="sm"
@@ -451,15 +465,17 @@ export function BookmarkList({
         {smartView === 'duplicates' && duplicateGroups.length > 0 && (
           <div className="list-toolbar-row">
             <span className="wf-muted">
-              精確重複會保留最早加入的一筆並預設勾選移除；疑似重複只列出，需人工確認。
+              {hasExactDuplicates
+                ? '刪除完全相同網址的副本，每組保留最早加入的一筆。刪除前會備份。'
+                : '目前只有疑似重複。核對網址後，可按該筆書籤的「刪除」。'}
             </span>
             <button
               type="button"
-              className="sm primary"
-              disabled={busy}
-              onClick={onGenerateDuplicatePlan}
+              className="sm danger"
+              disabled={busy || !hasExactDuplicates}
+              onClick={onDeleteDuplicates}
             >
-              產生重複清理預覽
+              刪除重複書籤
             </button>
           </div>
         )}

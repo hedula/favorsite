@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { orchestrateOrganizePlan } from '@/core/ai-orchestrator';
 import { buildSanitizedAiBatch, parseAndMapAiResponse } from '@/core/ai-schema';
 import { buildProjections, getWritableFolders } from '@/core/bookmark-engine';
-import { validatePlanDraft } from '@/core/planner';
+import { applyApprovedPlan, restoreJob } from '@/core/executor';
+import { validatePlanDraft, type DraftOperationInput } from '@/core/planner';
 import {
   probePromptApiAvailability,
   PromptApiSessionPool,
@@ -10,7 +11,7 @@ import {
   requestChromePromptApiPlan,
   type LanguageModelGlobal,
 } from '@/core/prompt-api';
-import { createDefaultSettings } from '@/core/store';
+import { createDefaultSettings, FavorsiteStore } from '@/core/store';
 import type { ChromeBookmarkNode, PlanScope } from '@/core/types';
 import { MockChromeBookmarks } from './mock-bookmarks';
 
@@ -94,6 +95,7 @@ describe('Chrome Prompt API (Gemini Nano), payload safety, and offline rule degr
       id: 'b1',
       title: 'Secret Token Page',
       domain: 'docs.example.com',
+      currentFolderId: 'f1',
     });
     expect(JSON.stringify(batchNoPath.bookmarks)).not.toContain('token=abc123');
     expect(JSON.stringify(batchNoPath.bookmarks)).not.toContain('secret');
@@ -174,8 +176,8 @@ describe('Chrome Prompt API (Gemini Nano), payload safety, and offline rule degr
     expect(validated.operations[1].type).toBe('moveBookmark');
   });
 
-  it('uses Chrome Prompt API (LanguageModel) first when available, destroys session, and validates output', async () => {
-    const { flattened, scope, inbox } = await setupBookmarks();
+  it('validates a Nano draft, applies it only after approval, and restores the bookmark', async () => {
+    const { mock, flattened, scope, inbox, kv, r2 } = await setupBookmarks();
     let destroyed = false;
     let receivedConstraint = false;
 
@@ -188,14 +190,20 @@ describe('Chrome Prompt API (Gemini Nano), payload safety, and offline rule degr
         maxTemperature: 2,
       }),
       create: async () => ({
-        prompt: async (_input, opts) => {
+        prompt: async (input, opts) => {
           if (opts?.responseConstraint) receivedConstraint = true;
+          const payload = JSON.parse(input);
+          const parent = payload.existingFolders.find((folder: { id: string }) =>
+            folder.id === payload.newFolderParentId,
+          );
+          expect(parent?.title).toBe('Inbox');
+          expect(payload.bookmarks[0].currentFolderId).toBe(payload.newFolderParentId);
           return JSON.stringify({
             operations: [
               {
                 type: 'createFolder',
                 tempFolderId: 'new_kv',
-                parentId: 'f3', // Inbox
+                parentId: payload.newFolderParentId,
                 title: 'KV',
                 reason: '建立 KV 分類資料夾',
               },
@@ -244,7 +252,27 @@ describe('Chrome Prompt API (Gemini Nano), payload safety, and offline rule degr
       'createFolder',
       'moveBookmark',
     ]);
+    expect(plan.operations[0]).toMatchObject({ parentId: inbox.id, enabled: true });
     expect(plan.warnings.some((w) => w.includes('非法操作類型'))).toBe(true);
+    expect((await mock.get(kv.id))[0].parentId).toBe(inbox.id);
+
+    const store = new FavorsiteStore('test_nano_approval');
+    await store.savePlan(plan);
+    const job = await applyApprovedPlan({
+      adapter: mock,
+      store,
+      plan,
+      approvedRevision: plan.revision,
+    });
+    expect(job).toMatchObject({ status: 'completed', completedCount: 2 });
+    const moved = (await mock.get(kv.id))[0];
+    expect((await mock.get(moved.parentId!))[0]).toMatchObject({ title: 'KV', parentId: inbox.id });
+    expect((await mock.get(r2.id))[0].parentId).toBe(inbox.id);
+
+    const restored = await restoreJob({ adapter: mock, store, jobId: job.jobId });
+    expect(restored.status).toBe('restored');
+    expect((await mock.get(kv.id))[0].parentId).toBe(inbox.id);
+    expect((await mock.getChildren(inbox.id)).map((node) => node.id)).toEqual([kv.id, r2.id]);
   });
 
   it('degrades cleanly to offline rule engine when device does not support Chrome Prompt API', async () => {
@@ -270,6 +298,152 @@ describe('Chrome Prompt API (Gemini Nano), payload safety, and offline rule degr
     ).toBe(true);
     expect(plan.operations.filter((o) => o.type === 'createFolder')).toHaveLength(2);
     expect(plan.operations.filter((o) => o.type === 'moveBookmark')).toHaveLength(2);
+  });
+
+  it.each(['依網站網域把同站台書籤分群整理', '依網域整理'])(
+    'groups same-domain bookmarks for the literal instruction %s',
+    async (instruction) => {
+      const { flattened, scope, inbox, kv, r2 } = await setupBookmarks();
+      const plan = await orchestrateOrganizePlan({
+        preferredProvider: 'rule',
+        flattened,
+        scope,
+        instruction,
+        metadataByNodeId: new Map(),
+        profileKey: 'prof_ai',
+        snapshotId: 'snap_domain',
+        baseParentId: inbox.id,
+        settings: createDefaultSettings('prof_ai'),
+      });
+
+      expect(plan.operations).toEqual([
+        expect.objectContaining({ type: 'createFolder', parentId: inbox.id, title: 'developers.cloudflare.com' }),
+        expect.objectContaining({ type: 'moveBookmark', nodeId: kv.id, enabled: true }),
+        expect.objectContaining({ type: 'moveBookmark', nodeId: r2.id, enabled: true }),
+      ]);
+    },
+  );
+
+  it.each(['empty', 'no-op', 'tags-only'] as const)(
+    'uses the requested categories when the Nano draft is %s',
+    async (draftKind) => {
+      const { flattened, scope, inbox, kv } = await setupBookmarks();
+      const drafts = {
+        empty: [],
+        'no-op': [{ type: 'moveBookmark', nodeId: kv.id, toParentId: inbox.id, reason: 'Already there' }],
+        'tags-only': [{ type: 'addTag', nodeId: kv.id, tagsToAdd: ['KV'], reason: 'KV' }],
+      } satisfies Record<string, DraftOperationInput[]>;
+      const plan = await orchestrateOrganizePlan({
+        preferredProvider: 'auto',
+        flattened,
+        scope,
+        instruction: '依 KV、R2 分類',
+        metadataByNodeId: new Map(),
+        profileKey: 'prof_ai',
+        snapshotId: 'snap_empty',
+        baseParentId: inbox.id,
+        settings: createDefaultSettings('prof_ai'),
+        precomputedChromeAiDraft: {
+          draftOps: drafts[draftKind],
+          warnings: [],
+        },
+      });
+
+      expect(plan.fallbackFrom).toBe('chrome-prompt-api');
+      expect(plan.source).toBe('rule');
+      expect(plan.operations.filter((op) => op.type === 'moveBookmark' && op.enabled)).toHaveLength(2);
+      expect(plan.warnings.some((warning) => warning.includes('Gemini Nano 未產生'))).toBe(true);
+    },
+  );
+
+  it('keeps a failed rename request from becoming unrelated rule-based moves', async () => {
+    const { flattened, scope } = await setupBookmarks();
+    const plan = await orchestrateOrganizePlan({
+      preferredProvider: 'auto',
+      flattened,
+      scope,
+      instruction: 'Rename these bookmarks to concise English names',
+      metadataByNodeId: new Map(),
+      profileKey: 'prof_ai',
+      snapshotId: 'snap_rename',
+      settings: createDefaultSettings('prof_ai'),
+      precomputedChromeAiError: 'Model did not respond',
+    });
+
+    expect(plan.operations).toEqual([]);
+    expect(plan.warnings.some((warning) => warning.includes('本機規則無法處理這個指令'))).toBe(true);
+  });
+
+  it('enforces tag-only intent even when Nano suggests creating folders and moving', async () => {
+    const { flattened, scope, inbox, kv } = await setupBookmarks();
+    const plan = await orchestrateOrganizePlan({
+      preferredProvider: 'auto',
+      flattened,
+      scope,
+      instruction: '不動資料夾，自動幫書籤補上主題標籤',
+      metadataByNodeId: new Map(),
+      profileKey: 'prof_ai',
+      snapshotId: 'snap_tags',
+      baseParentId: inbox.id,
+      settings: createDefaultSettings('prof_ai'),
+      precomputedChromeAiDraft: {
+        draftOps: [
+          { type: 'createFolder', tempFolderId: 'new_kv', parentId: inbox.id, title: 'KV', reason: 'KV' },
+          { type: 'moveBookmark', nodeId: kv.id, toTempFolderId: 'new_kv', reason: 'KV' },
+          { type: 'addTag', nodeId: kv.id, tagsToAdd: ['KV'], reason: 'KV' },
+        ],
+        warnings: [],
+      },
+    });
+
+    expect(plan.source).toBe('chrome-prompt-api');
+    expect(plan.operations).toEqual([expect.objectContaining({ type: 'addTag', tagsToAdd: ['KV'] })]);
+  });
+
+  it('rejects a Nano folder proposal under a different parent from the selected destination', async () => {
+    const { flattened, scope, inbox } = await setupBookmarks();
+    const plan = await orchestrateOrganizePlan({
+      preferredProvider: 'auto',
+      flattened,
+      scope,
+      instruction: '建立「閱讀」資料夾',
+      metadataByNodeId: new Map(),
+      profileKey: 'prof_ai',
+      snapshotId: 'snap_wrong_parent',
+      baseParentId: inbox.id,
+      settings: createDefaultSettings('prof_ai'),
+      precomputedChromeAiDraft: {
+        draftOps: [
+          { type: 'createFolder', tempFolderId: 'new_reading', parentId: '2', title: '閱讀', reason: 'Reading' },
+        ],
+        warnings: [],
+      },
+    });
+
+    expect(plan.operations).toEqual([]);
+    expect(plan.warnings.some((warning) => warning.includes('所選新建位置'))).toBe(true);
+  });
+
+  it('does not turn a request to inspect duplicates into a removal plan', async () => {
+    const { mock, scope, inbox } = await setupBookmarks();
+    await mock.create({
+      parentId: inbox.id,
+      title: 'KV copy',
+      url: 'https://developers.cloudflare.com/kv/get-started/',
+    });
+    const plan = await orchestrateOrganizePlan({
+      preferredProvider: 'auto',
+      flattened: buildProjections(await mock.getTree(), 'prof_ai'),
+      scope,
+      instruction: '找出重複書籤，請勿刪除',
+      metadataByNodeId: new Map(),
+      profileKey: 'prof_ai',
+      snapshotId: 'snap_inspect',
+      settings: createDefaultSettings('prof_ai'),
+    });
+
+    expect(plan.operations).toEqual([]);
+    expect(plan.warnings.some((warning) => warning.includes('「重複書籤」'))).toBe(true);
   });
 
   it('reports normalized 0..1 download progress, clones baseline session without passing signal to create(), and distinguishes user abort', async () => {

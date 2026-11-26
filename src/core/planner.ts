@@ -461,28 +461,29 @@ interface RuleCategory {
   keywords: string[];
 }
 
-function extractRequestedCategoriesFromInstruction(
+export function extractRequestedCategoriesFromInstruction(
   instruction: string,
 ): RuleCategory[] {
-  const trimmed = instruction.trim();
-  if (!trimmed) return [];
-
-  // Pattern 1: Chinese "依 A、B、C 分類" / "按 A, B, C 整理"
-  const zhMatch = trimmed.match(
-    /(?:依|照|按|分成|分為|歸類為|分類為)\s*([^\n。！？]+?)(?:分類|整理|歸類|$)/,
+  const text = instruction.trim().replace(/[。.!！]+$/, '');
+  const byCategories = text.match(
+    /(?:依照|按照|依|按|照)\s*([^\n。！？]+?)\s*(?:分類|整理|歸類)(?:並(?:加上|新增|補上)標籤)?$/,
   );
-  // Pattern 2: English "by A, B, and C" / "into A, B, C"
-  const enMatch = trimmed.match(
-    /(?:by|into)\s+([A-Za-z0-9\u3400-\u9fff_\-,\s/、]+?)(?:\s+folders?|\.|$)/i,
+  const intoCategories = text.match(/(?:分成|分為|歸類為|分類為)\s*([^\n。！？]+)$/);
+  const englishCategories = text.match(
+    /^(?:group|organize|classify|sort)\b.*?\b(?:by|into)\s+([A-Za-z0-9\u3400-\u9fff_\-,\s/、]+?)(?:\s+folders?)?$/i,
   );
 
-  const rawList = zhMatch?.[1] ?? enMatch?.[1] ?? '';
+  const rawList = byCategories?.[1] ?? intoCategories?.[1] ?? englishCategories?.[1] ?? '';
   if (!rawList) return [];
 
   const parts = rawList
     .split(/[、,，/]|(?:\s+(?:and|與|和|及)\s*)|(?:與|和|及)/i)
-    .map((s) => s.trim())
-    .filter((s) => s.length >= 1 && s.length <= 32);
+    .map((s) => s.trim().replace(/^(?:and|與|和|及)\s+/i, ''))
+    .filter(Boolean);
+  if (parts.some((part) =>
+    part.length > 32 ||
+    /^(?:標題|名稱|日期|時間|字母(?:順序)?|網址|title|name|date|url|alphabetical(?: order)?)$/i.test(part)
+  )) return [];
 
   const uniqueNames = Array.from(new Set(parts));
   return uniqueNames.map((name) => {
@@ -497,6 +498,28 @@ function extractRequestedCategoriesFromInstruction(
     if (lower === 'durable objects') keywords.push('durable-objects');
     return { name, keywords };
   });
+}
+
+export function isDomainGroupingInstruction(instruction: string): boolean {
+  const text = instruction.trim().replace(/[。.!！]+$/, '');
+  return /^(?:(?:請|幫我)\s*)?(?:依照|按照|依|按)\s*(?:網站網域|網域|網站|站台)(?:把同站台書籤)?(?:分群(?:整理)?|整理|分類|歸類)$/.test(text) ||
+    /^(?:group|organize|sort)(?: (?:these )?bookmarks)? by (?:website|domain)$/i.test(text);
+}
+
+export function isTagOnlyInstruction(instruction: string): boolean {
+  return /標籤|\btags?\b/i.test(instruction) &&
+    /(?:只|僅)(?:需要|需|要|想)?\s*(?:新增|加|補|標|替|幫|為)|不(?:要)?(?:動資料夾|移動|搬移)|\bonly\s+(?:add|apply|tag)|\bwithout\s+moving/i.test(instruction);
+}
+
+function isTopicGroupingInstruction(instruction: string): boolean {
+  const text = instruction.trim().replace(/[。.!！]+$/, '');
+  return /^(?:(?:請|幫我)\s*)?(?:依照|按照|依|按)\s*(?:書籤)?主題(?:自動)?(?:分類|整理|歸類|歸納)(?:目前(?:範圍|資料夾)(?:內|的)?書籤)?(?:並加上標籤)?$/.test(text) ||
+    /^(?:group|organize|sort)(?: (?:these )?bookmarks)? by topics?$/i.test(text);
+}
+
+export function isCategoryGroupingInstruction(instruction: string): boolean {
+  return isTopicGroupingInstruction(instruction) ||
+    extractRequestedCategoriesFromInstruction(instruction).length > 0;
 }
 
 function defaultKeywordCategories(): RuleCategory[] {
@@ -583,11 +606,11 @@ function defaultKeywordCategories(): RuleCategory[] {
   ];
 }
 
-function matchCategoriesForBookmark(
-  b: BookmarkProjection,
+export function matchCategoriesForText(
+  text: string,
   categories: RuleCategory[],
 ): RuleCategory[] {
-  const haystack = `${b.title} ${b.domain} ${b.url ?? ''}`.toLowerCase();
+  const haystack = text.toLowerCase();
   const matched: RuleCategory[] = [];
   for (const cat of categories) {
     const hit = cat.keywords.some((kw) => {
@@ -600,6 +623,40 @@ function matchCategoriesForBookmark(
     if (hit) matched.push(cat);
   }
   return matched;
+}
+
+export function createCategoryTargetResolver(
+  flattened: FlattenedTree,
+  baseParentId: string,
+  draftOps: DraftOperationInput[],
+) {
+  const existingFolders = new Map<string, BookmarkProjection>();
+  for (const child of flattened.childrenByParent.get(baseParentId) ?? []) {
+    if (child.isFolder && child.canAddChild) {
+      existingFolders.set(child.title.trim().toLowerCase(), child);
+    }
+  }
+  const pendingFolders = new Map<string, string>();
+
+  return (category: string): { toParentId?: string; toTempFolderId?: string } => {
+    const name = category.toLowerCase();
+    const existing = existingFolders.get(name);
+    if (existing) return { toParentId: existing.nodeId };
+
+    let tempFolderId = pendingFolders.get(name);
+    if (!tempFolderId) {
+      tempFolderId = `temp_folder_${pendingFolders.size + 1}`;
+      pendingFolders.set(name, tempFolderId);
+      draftOps.push({
+        type: 'createFolder',
+        tempFolderId,
+        parentId: baseParentId,
+        title: category,
+        reason: `建立「${category}」分類資料夾`,
+      });
+    }
+    return { toTempFolderId: tempFolderId };
+  };
 }
 
 export function generateRuleBasedPlan(params: {
@@ -623,6 +680,26 @@ export function generateRuleBasedPlan(params: {
   const { inScopeBookmarks } = collectScopeNodes(flattened, scope);
   const writableBookmarks = inScopeBookmarks.filter((b) => b.writable);
 
+  const text = instruction.trim().replace(/[。.!！]+$/, '');
+  const tagOnlyMode = isTagOnlyInstruction(text);
+  const groupByDomainMode = isDomainGroupingInstruction(text);
+  const topicMode = isTopicGroupingInstruction(text) ||
+    (tagOnlyMode && /主題|\btopic\b/i.test(text));
+  const parsedCategories = groupByDomainMode || topicMode ? [] : extractRequestedCategoriesFromInstruction(text);
+  if (text && !groupByDomainMode && !topicMode && parsedCategories.length === 0) {
+    return createPlanFromValidatedDraft({
+      draftOps: [],
+      flattened,
+      scope,
+      instruction,
+      source: 'rule',
+      metadataByNodeId,
+      profileKey,
+      snapshotId,
+      extraWarnings: ['本機規則無法處理這個指令。可使用依主題、依網域或依指定分類整理。'],
+    });
+  }
+
   // Choose base parent folder for new category subfolders
   let baseParentId = params.baseParentId;
   if (!baseParentId || !flattened.byId.get(baseParentId)?.canAddChild) {
@@ -638,51 +715,11 @@ export function generateRuleBasedPlan(params: {
     }
   }
 
-  const parsedCategories = extractRequestedCategoriesFromInstruction(instruction);
-  const tagOnlyMode =
-    /(?:只|僅).*(?:標籤|tag)|不動資料夾|補上.*標籤/i.test(instruction);
-  const groupByDomainMode =
-    parsedCategories.length === 0 &&
-    !tagOnlyMode &&
-    /(?:依|按).*(?:網域|網站|domain)/i.test(instruction);
-
   const categories =
     parsedCategories.length > 0 ? parsedCategories : defaultKeywordCategories();
 
-  // Check existing subfolders under baseParentId
-  const existingChildren = flattened.childrenByParent.get(baseParentId) ?? [];
-  const existingFolderByName = new Map<string, BookmarkProjection>();
-  for (const child of existingChildren) {
-    if (child.isFolder && child.canAddChild) {
-      existingFolderByName.set(child.title.trim().toLowerCase(), child);
-    }
-  }
-
   const draftOps: DraftOperationInput[] = [];
-  const createdTempByCat = new Map<string, string>();
-  let tempSeq = 1;
-
-  const ensureCategoryTarget = (
-    catName: string,
-  ): { toParentId?: string; toTempFolderId?: string } => {
-    const existing = existingFolderByName.get(catName.toLowerCase());
-    if (existing) {
-      return { toParentId: existing.nodeId };
-    }
-    let tempId = createdTempByCat.get(catName.toLowerCase());
-    if (!tempId) {
-      tempId = `temp_folder_${tempSeq++}`;
-      createdTempByCat.set(catName.toLowerCase(), tempId);
-      draftOps.push({
-        type: 'createFolder',
-        tempFolderId: tempId,
-        parentId: baseParentId!,
-        title: catName,
-        reason: `建立「${catName}」分類資料夾`,
-      });
-    }
-    return { toTempFolderId: tempId };
-  };
+  const ensureCategoryTarget = createCategoryTargetResolver(flattened, baseParentId, draftOps);
 
   if (groupByDomainMode) {
     const byDomain = new Map<string, BookmarkProjection[]>();
@@ -708,7 +745,7 @@ export function generateRuleBasedPlan(params: {
     }
   } else {
     for (const b of writableBookmarks) {
-      const matched = matchCategoriesForBookmark(b, categories);
+      const matched = matchCategoriesForText(`${b.title} ${b.domain} ${b.url ?? ''}`, categories);
       if (matched.length === 1) {
         const cat = matched[0];
         if (!tagOnlyMode) {
@@ -1113,21 +1150,28 @@ export function generateDeadLinkCleanupPlan(params: {
   };
 }
 
-/**
- * True when an organize instruction asks to remove / clean up duplicate bookmarks.
- * Such requests are answered by the deterministic duplicate planner, never by the model
- * (model output is not allowed to remove bookmarks).
- */
-export function isDuplicateCleanupInstruction(instruction: string): boolean {
+/** Keep duplicate requests on the same path in Studio and the background worker. */
+export function getDuplicateInstructionIntent(instruction: string): 'cleanup' | 'inspect' | null {
   const text = instruction.trim();
-  if (!text) return false;
-  if (/去重|dedup|de-dup|(remove|delete|clean\s*up|merge)\s+(the\s+)?duplicates?/i.test(text)) {
-    return true;
-  }
-  return (
-    /重複/.test(text) &&
-    /移除|刪除|刪掉|清理|清除|只留|只保留|保留一|合併|整理/.test(text)
-  );
+  const requestsDeduplication = /去重|\bde-?dup(?:e|licate|lication)?\b/i.test(text);
+  if (!requestsDeduplication && !/重[複覆]|\bduplicates?\b/i.test(text)) return null;
+  if (/(?:非|不|沒(?:有)?)重[複覆]|\bnon[ -]?duplicates?\b/i.test(text)) return null;
+
+  const forbidsMutation =
+    /(?:不(?:要|得|能|想)?|勿|別|避免)\s*(?:(?:直接|自動|實際|幫我)\s*)*(?:刪|移除|清[理除掉]|合併|改動|修改|去重)/.test(text) ||
+    /\b(?:do not|don['’]t|never|without)\s+(?:(?:automatically|directly|actually)\s+)*(?:delet(?:e|ing)|remov(?:e|ing)|edit|change|clean|merg(?:e|ing)|de-?dup(?:e|licate)?)\b/i.test(text);
+  const onlyInspection =
+    /(?:只|僅)(?:要|想)?\s*(?:先\s*)?(?:找出|查找|列出|顯示|檢查|標記|查看|預覽)/.test(text) ||
+    /\b(?:only|just)\s+(?:find|list|show|inspect|mark|preview)\b/i.test(text);
+  if (forbidsMutation || onlyInspection) return 'inspect';
+
+  const requestsCleanup =
+    /刪|移除|清[理除掉]|合併|只(?:保)?留|保留[一1]|\b(?:remove|delete|clean\s*up|merge)\b/i.test(text);
+  if (requestsDeduplication || requestsCleanup) return 'cleanup';
+
+  return /找出|查找|列出|顯示|檢查|標記|查看|預覽|\b(?:find|list|show|inspect|mark|preview)\b/i.test(text)
+    ? 'inspect'
+    : null;
 }
 
 /**
@@ -1280,16 +1324,24 @@ export function generateDuplicateCleanupPlan(params: {
   ).length;
 
   const warnings: string[] = [];
-  if (exactRemovals + suspectedRemovals === 0) {
-    warnings.push('所選範圍內沒有可清理的重複書籤。');
-  } else {
+  if (groups.length === 0) {
+    warnings.push('沒有找到網址完全相同或疑似重複的書籤。');
+  } else if (operations.length === 0) {
+    warnings.push(scope.type === 'all'
+      ? '找到的重複書籤沒有可移除的副本。可前往「重複書籤」檢視群組。'
+      : '目前範圍沒有可移除的副本。若要檢查其他資料夾，請勾選「擴大範圍至全部可寫書籤」後重新產生預覽。');
+  }
+  if (exactRemovals > 0) {
     warnings.push(
-      `精確重複 ${exactGroups} 組：每組保留最早加入的一筆，其餘 ${exactRemovals} 筆已預設勾選移除。` +
-        (suspectedRemovals > 0
-          ? ` 疑似重複 ${suspectedGroups} 組（${suspectedRemovals} 筆）未預設勾選，請逐筆確認。`
-          : '') +
-        ' 移除前會保存快照，可於歷程頁復原。',
+      `網址完全相同的書籤有 ${exactGroups} 組。每組保留最早加入的一筆，已勾選 ${exactRemovals} 筆可移除的副本。`,
     );
+  }
+  if (suspectedRemovals > 0) {
+    const label = exactRemovals === 0 ? '目前只有疑似重複' : '另有疑似重複';
+    warnings.push(`${label} ${suspectedGroups} 組（${suspectedRemovals} 筆），請逐筆核對並勾選要移除的副本。`);
+  }
+  if (operations.length > 0) {
+    warnings.push('套用後可於歷程頁復原。');
   }
 
   const now = Date.now();
@@ -1308,6 +1360,21 @@ export function generateDuplicateCleanupPlan(params: {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+export function getDirectDuplicateOperations(operations: PlanOperation[]): PlanOperation[] {
+  const removals = operations.filter((operation): operation is RemoveBookmarkOperation =>
+    operation.enabled &&
+    operation.type === 'removeBookmark' &&
+    operation.removalKind === 'duplicate_exact' &&
+    Boolean(operation.keepNodeId && operation.bookmarkUrl) &&
+    operation.keepNodeId !== operation.nodeId,
+  );
+  const keeperIds = new Set(removals.map((operation) => operation.keepNodeId));
+  const tags = operations.filter((operation) =>
+    operation.enabled && operation.type === 'addTag' && keeperIds.has(operation.nodeId),
+  );
+  return [...removals, ...tags];
 }
 
 export function enableDead404Removals(plan: OrganizePlan): OrganizePlan {

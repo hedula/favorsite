@@ -199,9 +199,9 @@ export type PlanOperation =
   | AddTagOperation
   | RemoveBookmarkOperation;
 
-export type AiProviderPreference = 'auto' | 'chrome-prompt-api' | 'rule';
+export type AiProviderPreference = 'auto' | 'chrome-prompt-api' | 'transformers-js' | 'rule';
 
-export type PlanSource = 'rule' | 'chrome-prompt-api' | 'manual';
+export type PlanSource = 'rule' | 'chrome-prompt-api' | 'transformers-js' | 'manual';
 
 export interface OrganizePlan {
   planId: string;

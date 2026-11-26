@@ -5,6 +5,7 @@ import {
   type AiPlanResult,
   type PreparedAiBatch,
 } from './ai-schema';
+import { isTagOnlyInstruction } from './planner';
 
 export type ChromePromptAvailability =
   | 'available'
@@ -389,7 +390,9 @@ export async function requestChromePromptApiPlan(params: {
     }, timeoutMs);
 
     const userPayload = JSON.stringify({
-      instruction: instruction.slice(0, 500),
+      instruction: instruction.trim(),
+      newFolderParentId: batch.newFolderParentId,
+      allowedOperations: isTagOnlyInstruction(instruction) ? ['addTag'] : undefined,
       existingFolders: batch.folders,
       bookmarks: batch.bookmarks,
     });

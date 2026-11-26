@@ -5,7 +5,7 @@ import { buildProjections } from '@/core/bookmark-engine';
 import { applyApprovedPlan, restoreJob } from '@/core/executor';
 import {
   generateDuplicateCleanupPlan,
-  isDuplicateCleanupInstruction,
+  getDuplicateInstructionIntent,
 } from '@/core/planner';
 import { validateStudioMessage } from '@/core/protocol';
 import { createDefaultSettings, FavorsiteStore } from '@/core/store';
@@ -99,6 +99,7 @@ describe('duplicate cleanup plan', () => {
     expect(rm[0].enabled).toBe(false);
     expect(rm[0].requiresReview).toBe(true);
     expect(rm[0].removalKind).toBe('duplicate_suspected');
+    expect(plan.warnings[0]).toContain('目前只有疑似重複');
   });
 
   it('only removes copies inside the scope and always leaves one copy', async () => {
@@ -127,8 +128,30 @@ describe('duplicate cleanup plan', () => {
       snapshotId: 's',
     });
     expect(removals(archivePlan.operations)).toEqual([]);
-    expect(archivePlan.warnings[0]).toContain('沒有可清理的重複書籤');
-    expect(outside.id).toBeTruthy();
+    expect(archivePlan.warnings[0]).toContain('擴大範圍至全部可寫書籤');
+    expect(removals(folderPlan.operations)[0].keepNodeId).toBe(outside.id);
+  });
+
+  it('pauses if the bookmark kept outside the selected folder no longer has the same URL', async () => {
+    const { mock, store, profileKey, inbox, archive } = await setup();
+    const url = 'https://dup.example/';
+    const keeper = await mock.create({ parentId: archive.id, title: 'First', url });
+    const copy = await mock.create({ parentId: inbox.id, title: 'Copy', url });
+    const plan = generateDuplicateCleanupPlan({
+      flattened: buildProjections(await mock.getTree(), profileKey),
+      scope: { type: 'folder', folderId: inbox.id, targetFolderIds: [inbox.id] },
+      metadataByNodeId: await metaMap(store, profileKey),
+      profileKey,
+      snapshotId: 's',
+    });
+    expect(removals(plan.operations).map((op) => op.nodeId)).toEqual([copy.id]);
+    await store.savePlan(plan);
+    await mock.update(keeper.id, { url: 'https://dup.example/updated' });
+
+    const job = await applyApprovedPlan({ adapter: mock, store, plan, approvedRevision: plan.revision });
+
+    expect(job.status).toBe('paused_conflict');
+    expect((await mock.get(copy.id))[0].url).toBe(url);
   });
 
   it('never proposes removing a managed (read-only) copy', async () => {
@@ -165,27 +188,42 @@ describe('duplicate cleanup plan', () => {
 
 describe('duplicate instructions are routed to the deterministic planner', () => {
   it.each([
-    ['移除重複書籤，只留 1 個', true],
-    ['刪除重複的書籤', true],
-    ['重複書籤只保留一筆', true],
-    ['幫我去重', true],
-    ['remove duplicates', true],
-    ['依主題自動歸納目前範圍書籤並加上標籤', false],
-    ['不動資料夾，自動幫書籤補上主題標籤', false],
-    ['依 設計、開發、閱讀 分類', false],
+    ['我要刪除重複書籤', 'cleanup'],
+    ['幫我找出重複書籤，再把副本刪掉', 'cleanup'],
+    ['把重覆的書籤刪掉', 'cleanup'],
+    ['Find duplicate bookmarks, then delete the extra copies', 'cleanup'],
+    ['移除重複書籤，只留 1 個', 'cleanup'],
+    ['只移除重複書籤', 'cleanup'],
+    ['刪除重複的書籤', 'cleanup'],
+    ['重複書籤只保留一筆', 'cleanup'],
+    ['幫我去重', 'cleanup'],
+    ['remove duplicates', 'cleanup'],
+    ["Don't automatically remove duplicates", 'inspect'],
+    ['只列出重複書籤', 'inspect'],
+    ['找出重複書籤', 'inspect'],
+    ['只想檢查可以刪除哪些重複書籤', 'inspect'],
+    ['找出重複書籤，請勿刪除', 'inspect'],
+    ['找出重複書籤，別刪', 'inspect'],
+    ['刪除非重複書籤', null],
+    ['依主題自動歸納目前範圍書籤並加上標籤', null],
+    ['不動資料夾，自動幫書籤補上主題標籤', null],
+    ['依 設計、開發、閱讀 分類', null],
   ])('%s → %s', (instruction, expected) => {
-    expect(isDuplicateCleanupInstruction(instruction)).toBe(expected);
+    expect(getDuplicateInstructionIntent(instruction)).toBe(expected);
   });
 
-  it('answers a duplicate instruction even when a model draft is supplied', async () => {
+  it.each([
+    ['transformers-js', '我要刪除重複書籤'],
+    ['chrome-prompt-api', '幫我找出重複書籤，再把副本刪掉'],
+  ] as const)('uses the duplicate planner with %s for %s', async (preferredProvider, instruction) => {
     const { mock, store, profileKey, inbox } = await setup();
     const a = await mock.create({ parentId: inbox.id, title: 'A', url: 'https://x.example/' });
     const b = await mock.create({ parentId: inbox.id, title: 'B', url: 'https://x.example/' });
     const plan = await orchestrateOrganizePlan({
-      preferredProvider: 'chrome-prompt-api',
+      preferredProvider,
       flattened: buildProjections(await mock.getTree(), profileKey),
       scope: { type: 'folder', folderId: inbox.id, targetFolderIds: [inbox.id] },
-      instruction: '移除重複書籤，只留 1 個',
+      instruction,
       metadataByNodeId: await metaMap(store, profileKey),
       profileKey,
       snapshotId: 's',
@@ -195,12 +233,19 @@ describe('duplicate instructions are routed to the deterministic planner', () =>
     const rm = removals(plan.operations);
     expect(rm).toHaveLength(1);
     expect(rm[0].enabled).toBe(true);
-    expect([a.id, b.id]).toContain(rm[0].nodeId);
+    expect(rm[0].nodeId).toBe(b.id);
+    expect(rm[0].keepNodeId).toBe(a.id);
     expect(plan.source).toBe('rule');
   });
 
-  it('validates the CREATE_DUPLICATE_PLAN message', () => {
-    expect(validateStudioMessage({ type: 'CREATE_DUPLICATE_PLAN', payload: { scope: ALL } })).toBeNull();
-    expect(validateStudioMessage({ type: 'CREATE_DUPLICATE_PLAN', payload: {} })).not.toBeNull();
+  it('validates explicit scopes for direct duplicate deletion', () => {
+    expect(validateStudioMessage({ type: 'DELETE_DUPLICATES', payload: { scope: ALL } })).toBeNull();
+    expect(validateStudioMessage({ type: 'DELETE_DUPLICATES', payload: {} })).not.toBeNull();
+    for (const type of ['folder', 'selection']) {
+      expect(validateStudioMessage({
+        type: 'DELETE_DUPLICATES',
+        payload: { scope: { type, targetFolderIds: [] } },
+      })).not.toBeNull();
+    }
   });
 });

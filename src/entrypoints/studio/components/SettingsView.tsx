@@ -67,12 +67,11 @@ export function SettingsView({
             <IconSparkles size={18} />
           </span>
           <h2 className="section-title">
-            AI 整理引擎：Chrome Prompt API（內建 Gemini Nano）
+            AI 整理引擎
           </h2>
         </div>
         <p className="wf-muted" style={{ margin: 0 }}>
-          隱私與零成本優先：直接呼叫桌面版 Chrome 內建的 <code>LanguageModel</code>{' '}
-          API（底層為本機 Gemini Nano），無需安裝本機伺服器、免 API 費用、零外部連線且不需額外主機權限。若裝置硬體或版本不支援，將自動降級為完全離線的本機規則模式。
+          可以使用桌面 Chrome 內建的 Gemini Nano、本機 Transformers.js 語意分類，或直接使用離線規則。
         </p>
 
         <div className="wf-banner" role="status" style={{ boxShadow: 'none' }}>
@@ -85,7 +84,7 @@ export function SettingsView({
                 flexWrap: 'wrap',
               }}
             >
-              <strong>裝置狀態：</strong>
+              <strong>Gemini Nano 狀態</strong>
               <span
                 className={`wf-badge ${promptApiStatus?.supported ? 'ok' : 'warn'}`}
               >
@@ -121,6 +120,7 @@ export function SettingsView({
             <option value="chrome-prompt-api">
               Chrome Prompt API（Gemini Nano · 不支援時降級本機離線規則）
             </option>
+            <option value="transformers-js">本機語意分類（Transformers.js）</option>
             <option value="rule">一律使用本機離線規則（不呼叫 AI）</option>
           </select>
         </div>
@@ -131,7 +131,7 @@ export function SettingsView({
             checked={includePath}
             onChange={(e) => setIncludePath(e.target.checked)}
           />
-          允許將裁剪後的 URL 路徑交由 Chrome 內建模型分析（仍嚴格略過 query、fragment 與憑證）
+          允許本機模型分析裁剪後的 URL 路徑。Query、fragment 與憑證會先排除。
         </label>
       </section>
 

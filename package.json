@@ -13,9 +13,11 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "generate:icons": "node scripts/generate-icons.mjs",
+    "prepare:semantic-model": "node scripts/prepare-semantic-model.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {
+    "@huggingface/transformers": "3.8.1",
     "minisearch": "^7.1.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
